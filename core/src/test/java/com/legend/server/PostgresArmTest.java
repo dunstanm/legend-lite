@@ -327,6 +327,19 @@ class PostgresArmTest {
         }
     }
 
+    @Test
+    void erfRunsNativelyOnPostgres() throws Exception {
+        var ctx = com.legend.Compiler.compileModel(ARM_MODEL.formatted(POSTGRES.connectionBody()));
+        var sqlQuery = com.legend.Compiler.query(ctx, "|erf(0.5)").lower("test::PgRuntime", false).plan();
+        String sql = POSTGRES.dialect().render(sqlQuery);
+        assertTrue(sql.contains("erf("), "Expected native erf() in Postgres plan: " + sql);
+        try (Connection c = POSTGRES.open()) {
+            var rows = column(c, sql);
+            assertEquals(1, rows.size());
+            assertEquals(0.5204998778130465, Double.parseDouble(rows.get(0)), 1e-14);
+        }
+    }
+
     /** {@code sql}'s first column, each row's text. */
     private static java.util.List<String> column(Connection c, String sql) throws Exception {
         java.util.List<String> out = new java.util.ArrayList<>();
