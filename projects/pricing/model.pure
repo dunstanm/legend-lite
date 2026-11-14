@@ -37,6 +37,35 @@ Class pricing::PrCashflow
    payReceive: Float[1];
 }
 
+Class pricing::PrSwaption
+{
+   tradeId: String[1];
+   currency: String[1];
+   discountCurveId: String[1];
+   projCurveId: String[1];
+   volSurfaceId: String[1];
+   expiryT: Float[1];
+   settleT: Float[1];
+   swapTenorT: Float[1];
+   cashFreq: Float[1];
+   nPeriods: Float[1];
+   settlementType: String[1];
+   strike: Float[1];
+   notional: Float[1];
+   isPayer: Boolean[1];
+   payReceive: Float[1];
+}
+
+Class pricing::PrVolPoint
+{
+   scenarioId: String[1];
+   volSurfaceId: String[1];
+   pointIdx: Integer[1];
+   expiryT: Float[1];
+   swapTenorT: Float[1];
+   vol: Float[1];
+}
+
 // Interpolate a discount factor P(0, t) from bracketing knots (t0, r0) and (t1, r1).
 // Supports LINEAR_ZERO, LOG_LINEAR_DF, and FLAT_FORWARD, clamping flat outside [t0, t1].
 function pricing::evalSegmentDf(
@@ -122,10 +151,10 @@ function pricing::curveDiscountFactors(
    ]);
 }
 
-// Price every cashflow across all scenarios in PrCurveKnot without assuming curve interpolation.
+// Price every linear cashflow across all scenarios in PrCurveKnot without assuming curve interpolation.
 function pricing::cashflowPvs(): meta::pure::metamodel::relation::Relation<(scenarioId:String[1], tradeId:String[1], legId:String[1], cfIdx:Integer[1], instrumentType:String[1], currency:String[1], pv:Float[1])>[1]
 {
-   let cfs = pricing::PrCashflow.all()->project(~[
+   let cfs = pricing::PrCashflow.all()->filter(cf | $cf.instrumentType != 'SWAPTION_UNDERLYING')->project(~[
       tradeId: cf | $cf.tradeId,
       legId: cf | $cf.legId,
       cfIdx: cf | $cf.cfIdx,
@@ -183,4 +212,377 @@ function pricing::cashflowPvs(): meta::pure::metamodel::relation::Relation<(scen
          ) * $x.dfPay
       )
    ]);
+}
+
+// Standard normal CDF via meta::legend::lite::erf.
+function pricing::normCdf(x: Float[1]): Float[1]
+{
+   0.5 * (1.0 + ($x / 1.4142135623730951)->erf());
+}
+
+// Black-76 swaption present value given transient annuity, forward swap rate, and interpolated vol.
+function pricing::black76SwaptionPv(
+   annuity: Float[1],
+   fwdRate: Float[1],
+   strike: Float[1],
+   expiryT: Float[1],
+   vol: Float[1],
+   notional: Float[1],
+   isPayer: Boolean[1],
+   payReceive: Float[1]
+): Float[1]
+{
+   let stdDev = $vol * $expiryT->sqrt();
+   let safeStd = if($stdDev > 1.0e-12, |$stdDev, |1.0e-12);
+   let d1 = (($fwdRate / $strike)->log() + 0.5 * $safeStd * $safeStd) / $safeStd;
+   let d2 = $d1 - $safeStd;
+   let payerVal = $fwdRate * pricing::normCdf($d1) - $strike * pricing::normCdf($d2);
+   let receiverVal = $strike * pricing::normCdf(-$d2) - $fwdRate * pricing::normCdf(-$d1);
+   let intrinsicPayer = if($fwdRate > $strike, |$fwdRate - $strike, |0.0);
+   let intrinsicReceiver = if($strike > $fwdRate, |$strike - $fwdRate, |0.0);
+   let optRate = if($stdDev <= 1.0e-12,
+      |if($isPayer, |$intrinsicPayer, |$intrinsicReceiver),
+      |if($isPayer, |$payerVal, |$receiverVal)
+   );
+   $payReceive * $notional * $annuity * $optRate;
+}
+
+// Bilinearly interpolate implied Black vol from PrVolPoint over (expiryT, swapTenorT),
+// falling back to scenarioId='BASE' when a rate-only scenario has no vol-surface override.
+function pricing::volInterpolate(
+   targets: meta::pure::metamodel::relation::Relation<(scenarioId:String[1], volSurfaceId:String[1], expiryT:Float[1], swapTenorT:Float[1])>[1]
+): meta::pure::metamodel::relation::Relation<(scenarioId:String[1], volSurfaceId:String[1], expiryT:Float[1], swapTenorT:Float[1], vol:Float[1])>[1]
+{
+   let volScens = pricing::PrVolPoint.all()
+      ->project(~[vsScenario: v | $v.scenarioId, vsSurf: v | $v.volSurfaceId])
+      ->distinct();
+   let resolvedTargets = $targets
+      ->join($volScens, meta::pure::functions::relation::JoinKind.LEFT, {l, r | ($l.scenarioId == $r.vsScenario) && ($l.volSurfaceId == $r.vsSurf)})
+      ->project(~[
+         scenarioId: x | $x.scenarioId,
+         volSurfaceId: x | $x.volSurfaceId,
+         expiryT: x | $x.expiryT,
+         swapTenorT: x | $x.swapTenorT,
+         effScen: x | if($x.vsScenario->isEmpty(), |'BASE', |$x.vsScenario->toOne())
+      ]);
+   let pts = pricing::PrVolPoint.all()->project(~[
+      vScen: v | $v.scenarioId,
+      vSurf: v | $v.volSurfaceId,
+      vExp: v | $v.expiryT,
+      vTen: v | $v.swapTenorT,
+      vVol: v | $v.vol
+   ]);
+   let brackets = $resolvedTargets
+      ->join($pts, meta::pure::functions::relation::JoinKind.INNER, {l, r | ($l.effScen == $r.vScen) && ($l.volSurfaceId == $r.vSurf)})
+      ->extend(~[
+         candE0: x | if($x.vExp <= $x.expiryT, |$x.vExp, |-1000000000.0),
+         candE1: x | if($x.vExp >= $x.expiryT, |$x.vExp, |1000000000.0),
+         candT0: x | if($x.vTen <= $x.swapTenorT, |$x.vTen, |-1000000000.0),
+         candT1: x | if($x.vTen >= $x.swapTenorT, |$x.vTen, |1000000000.0)
+      ])
+      ->groupBy(
+         ~[scenarioId, volSurfaceId, effScen, expiryT, swapTenorT],
+         ~[
+            eMin: x | $x.vExp: y | $y->min(),
+            eMax: x | $x.vExp: y | $y->max(),
+            e0Raw: x | $x.candE0: y | $y->max(),
+            e1Raw: x | $x.candE1: y | $y->min(),
+            tMin: x | $x.vTen: y | $y->min(),
+            tMax: x | $x.vTen: y | $y->max(),
+            t0Raw: x | $x.candT0: y | $y->max(),
+            t1Raw: x | $x.candT1: y | $y->min()
+         ]
+      )
+      ->extend(~[
+         e0: x | if($x.e0Raw < -999999999.0, |$x.eMin->toOne(), |$x.e0Raw->toOne()),
+         e1: x | if($x.e1Raw > 999999999.0, |$x.eMax->toOne(), |$x.e1Raw->toOne()),
+         t0: x | if($x.t0Raw < -999999999.0, |$x.tMin->toOne(), |$x.t0Raw->toOne()),
+         t1: x | if($x.t1Raw > 999999999.0, |$x.tMax->toOne(), |$x.t1Raw->toOne())
+      ]);
+   let c00 = $brackets->join($pts->project(~[s00: v|$v.vScen, f00: v|$v.vSurf, e00: v|$v.vExp, t00: v|$v.vTen, v00: v|$v.vVol]), meta::pure::functions::relation::JoinKind.INNER, {l, r | ($l.effScen == $r.s00) && ($l.volSurfaceId == $r.f00) && ($l.e0 == $r.e00) && ($l.t0 == $r.t00)});
+   let c01 = $c00->join($pts->project(~[s01: v|$v.vScen, f01: v|$v.vSurf, e01: v|$v.vExp, t01: v|$v.vTen, v01: v|$v.vVol]), meta::pure::functions::relation::JoinKind.INNER, {l, r | ($l.effScen == $r.s01) && ($l.volSurfaceId == $r.f01) && ($l.e0 == $r.e01) && ($l.t1 == $r.t01)});
+   let c10 = $c01->join($pts->project(~[s10: v|$v.vScen, f10: v|$v.vSurf, e10: v|$v.vExp, t10: v|$v.vTen, v10: v|$v.vVol]), meta::pure::functions::relation::JoinKind.INNER, {l, r | ($l.effScen == $r.s10) && ($l.volSurfaceId == $r.f10) && ($l.e1 == $r.e10) && ($l.t0 == $r.t10)});
+   let c11 = $c10->join($pts->project(~[s11: v|$v.vScen, f11: v|$v.vSurf, e11: v|$v.vExp, t11: v|$v.vTen, v11: v|$v.vVol]), meta::pure::functions::relation::JoinKind.INNER, {l, r | ($l.effScen == $r.s11) && ($l.volSurfaceId == $r.f11) && ($l.e1 == $r.e11) && ($l.t1 == $r.t11)});
+   $c11
+      ->extend(~[
+         we: x | if($x.e1 > $x.e0, |if($x.expiryT <= $x.e0, |0.0, |if($x.expiryT >= $x.e1, |1.0, |($x.expiryT - $x.e0) / ($x.e1 - $x.e0))), |0.0),
+         wt: x | if($x.t1 > $x.t0, |if($x.swapTenorT <= $x.t0, |0.0, |if($x.swapTenorT >= $x.t1, |1.0, |($x.swapTenorT - $x.t0) / ($x.t1 - $x.t0))), |0.0)
+      ])
+      ->project(~[
+         scenarioId: x | $x.scenarioId,
+         volSurfaceId: x | $x.volSurfaceId,
+         expiryT: x | $x.expiryT,
+         swapTenorT: x | $x.swapTenorT,
+         vol: x | (1.0 - $x.we) * ((1.0 - $x.wt) * $x.v00 + $x.wt * $x.v01) + $x.we * ((1.0 - $x.wt) * $x.v10 + $x.wt * $x.v11)
+      ]);
+}
+
+// Closed-form cash-settled swaption annuity: sum_{k=1..N} (1/f) * (1 + S/f)^(-k).
+function pricing::cashSettledAnnuity(rate: Float[1], nPeriods: Float[1], freq: Float[1]): Float[1]
+{
+   if($rate->abs() < 1.0e-8,
+      |($nPeriods / $freq) - ($nPeriods * ($nPeriods + 1.0) / (2.0 * $freq * $freq)) * $rate,
+      |(1.0 - (1.0 + ($rate / $freq))->pow(-$nPeriods)) / $rate
+   );
+}
+
+// Price every European swaption (PHYSICAL or CASH) across all curve scenarios.
+// Pure-as-function form: uses O(1) closed-form pricing::cashSettledAnnuity for CASH settlement.
+function pricing::swaptionPvs(): meta::pure::metamodel::relation::Relation<(scenarioId:String[1], tradeId:String[1], currency:String[1], annuity:Float[1], fwdRate:Float[1], vol:Float[1], pv:Float[1])>[1]
+{
+   let swpCfs = pricing::PrCashflow.all()
+      ->filter(cf | $cf.instrumentType == 'SWAPTION_UNDERLYING')
+      ->project(~[
+         tradeId: cf | $cf.tradeId,
+         discountCurveId: cf | $cf.discountCurveId,
+         projCurveId: cf | if($cf.projCurveId->isEmpty(), |$cf.discountCurveId, |$cf.projCurveId->toOne()),
+         accrualStartT: cf | $cf.accrualStartT,
+         accrualEndT: cf | $cf.accrualEndT,
+         payT: cf | $cf.payT,
+         dcf: cf | $cf.dcf,
+         spread: cf | $cf.spread,
+         isFloat: cf | $cf.isFloat
+      ])->extend(~jk: cf | 1);
+   let scenarios = pricing::PrCurveKnot.all()
+      ->project(~[scenarioId: k | $k.scenarioId])
+      ->distinct()
+      ->extend(~sjk: s | 1);
+   let swaptions = pricing::PrSwaption.all()->project(~[
+      sTradeId: s | $s.tradeId,
+      currency: s | $s.currency,
+      sDiscCurve: s | $s.discountCurveId,
+      volSurfaceId: s | $s.volSurfaceId,
+      expiryT: s | $s.expiryT,
+      settleT: s | $s.settleT,
+      swapTenorT: s | $s.swapTenorT,
+      cashFreq: s | $s.cashFreq,
+      nPeriods: s | $s.nPeriods,
+      settlementType: s | $s.settlementType,
+      strike: s | $s.strike,
+      notional: s | $s.notional,
+      isPayer: s | $s.isPayer,
+      payReceive: s | $s.payReceive
+   ])->extend(~wjk: s | 1);
+   let swpScen = $swaptions->join($scenarios, meta::pure::functions::relation::JoinKind.INNER, {l, r | $l.wjk == $r.sjk});
+   let cfScen = $swpCfs->join($scenarios, meta::pure::functions::relation::JoinKind.INNER, {l, r | $l.jk == $r.sjk});
+   let discTargets = $cfScen->project(~[scenarioId: x | $x.scenarioId, curveId: x | $x.discountCurveId, t: x | $x.payT])->distinct();
+   let settleTargets = $swpScen->project(~[scenarioId: x | $x.scenarioId, curveId: x | $x.sDiscCurve, t: x | $x.settleT])->distinct();
+   let startTargets = $cfScen->filter(x | $x.isFloat)->project(~[scenarioId: x | $x.scenarioId, curveId: x | $x.projCurveId, t: x | $x.accrualStartT])->distinct();
+   let endTargets = $cfScen->filter(x | $x.isFloat)->project(~[scenarioId: x | $x.scenarioId, curveId: x | $x.projCurveId, t: x | $x.accrualEndT])->distinct();
+   let allTargets = $discTargets->concatenate($settleTargets)->concatenate($startTargets)->concatenate($endTargets)->distinct();
+   let dfs = pricing::curveDiscountFactors($allTargets);
+   let withDfPay = $cfScen->join(
+      $dfs->project(~[dScen: x | $x.scenarioId, dCurve: x | $x.curveId, dT: x | $x.t, dfPay: x | $x.df]),
+      meta::pure::functions::relation::JoinKind.INNER,
+      {l, r | ($l.scenarioId == $r.dScen) && ($l.discountCurveId == $r.dCurve) && ($l.payT == $r.dT)}
+   );
+   let withDfStart = $withDfPay->join(
+      $dfs->project(~[sScen: x | $x.scenarioId, sCurve: x | $x.curveId, sT: x | $x.t, dfStart: x | $x.df]),
+      meta::pure::functions::relation::JoinKind.LEFT,
+      {l, r | ($l.scenarioId == $r.sScen) && ($l.projCurveId == $r.sCurve) && ($l.accrualStartT == $r.sT)}
+   );
+   let withDfEnd = $withDfStart->join(
+      $dfs->project(~[eScen: x | $x.scenarioId, eCurve: x | $x.curveId, eT: x | $x.t, dfEnd: x | $x.df]),
+      meta::pure::functions::relation::JoinKind.LEFT,
+      {l, r | ($l.scenarioId == $r.eScen) && ($l.projCurveId == $r.eCurve) && ($l.accrualEndT == $r.eT)}
+   );
+   let legAgg = $withDfEnd
+      ->extend(~[
+         annTerm: x | if($x.isFloat, |0.0, |$x.dcf * $x.dfPay),
+         fltTerm: x | if($x.isFloat, |$x.dcf * (((($x.dfStart->toOne() / $x.dfEnd->toOne()) - 1.0) / $x.dcf) + $x.spread) * $x.dfPay, |0.0)
+      ])
+      ->groupBy(
+         ~[scenarioId, tradeId],
+         ~[
+            physAnnuity: x | $x.annTerm: y | $y->sum(),
+            floatPv: x | $x.fltTerm: y | $y->sum()
+         ]
+      )
+      ->extend(~fwdRate: x | $x.floatPv->toOne() / $x.physAnnuity->toOne());
+
+   let swpWithLegs = $legAgg->join(
+      $swpScen->project(~[
+         sScenarioId: r | $r.scenarioId,
+         sTradeId: r | $r.sTradeId,
+         currency: r | $r.currency,
+         sDiscCurve: r | $r.sDiscCurve,
+         volSurfaceId: r | $r.volSurfaceId,
+         expiryT: r | $r.expiryT,
+         settleT: r | $r.settleT,
+         swapTenorT: r | $r.swapTenorT,
+         cashFreq: r | $r.cashFreq,
+         nPeriods: r | $r.nPeriods,
+         settlementType: r | $r.settlementType,
+         strike: r | $r.strike,
+         notional: r | $r.notional,
+         isPayer: r | $r.isPayer,
+         payReceive: r | $r.payReceive
+      ]),
+      meta::pure::functions::relation::JoinKind.INNER,
+      {l, r | ($l.scenarioId == $r.sScenarioId) && ($l.tradeId == $r.sTradeId)}
+   );
+   let withSettleDf = $swpWithLegs->join(
+      $dfs->project(~[stScen: x | $x.scenarioId, stCurve: x | $x.curveId, stT: x | $x.t, dfSettle: x | $x.df]),
+      meta::pure::functions::relation::JoinKind.INNER,
+      {l, r | ($l.scenarioId == $r.stScen) && ($l.sDiscCurve == $r.stCurve) && ($l.settleT == $r.stT)}
+   );
+   let volTargets = $withSettleDf->project(~[
+      scenarioId: x | $x.scenarioId,
+      volSurfaceId: x | $x.volSurfaceId,
+      expiryT: x | $x.expiryT,
+      swapTenorT: x | $x.swapTenorT
+   ])->distinct();
+   let vols = pricing::volInterpolate($volTargets);
+   let withVol = $withSettleDf->join(
+      $vols->project(~[vScen: v | $v.scenarioId, vSurf: v | $v.volSurfaceId, vExp: v | $v.expiryT, vTen: v | $v.swapTenorT, vol: v | $v.vol]),
+      meta::pure::functions::relation::JoinKind.INNER,
+      {l, r | ($l.scenarioId == $r.vScen) && ($l.volSurfaceId == $r.vSurf) && ($l.expiryT == $r.vExp) && ($l.swapTenorT == $r.vTen)}
+   );
+   $withVol
+      ->extend(~effAnnuity: x | if($x.settlementType == 'CASH', |$x.dfSettle * pricing::cashSettledAnnuity($x.fwdRate, $x.nPeriods, $x.cashFreq), |$x.physAnnuity->toOne()))
+      ->project(~[
+         scenarioId: x | $x.scenarioId,
+         tradeId: x | $x.tradeId,
+         currency: x | $x.currency,
+         annuity: x | $x.effAnnuity,
+         fwdRate: x | $x.fwdRate,
+         vol: x | $x.vol,
+         pv: x | pricing::black76SwaptionPv($x.effAnnuity, $x.fwdRate, $x.strike, $x.expiryT, $x.vol, $x.notional, $x.isPayer, $x.payReceive)
+      ]);
+}
+
+// Pure-as-compilation / relational row-sum counterpart for CASH settlement:
+// sums (1/f)*(1 + S/f)^(-k) across the underlying fixed-leg PrCashflow rows in groupBy.
+function pricing::swaptionPvsRowSum(): meta::pure::metamodel::relation::Relation<(scenarioId:String[1], tradeId:String[1], currency:String[1], annuity:Float[1], fwdRate:Float[1], vol:Float[1], pv:Float[1])>[1]
+{
+   let swpCfs = pricing::PrCashflow.all()
+      ->filter(cf | $cf.instrumentType == 'SWAPTION_UNDERLYING')
+      ->project(~[
+         tradeId: cf | $cf.tradeId,
+         cfIdx: cf | $cf.cfIdx,
+         discountCurveId: cf | $cf.discountCurveId,
+         projCurveId: cf | if($cf.projCurveId->isEmpty(), |$cf.discountCurveId, |$cf.projCurveId->toOne()),
+         accrualStartT: cf | $cf.accrualStartT,
+         accrualEndT: cf | $cf.accrualEndT,
+         payT: cf | $cf.payT,
+         dcf: cf | $cf.dcf,
+         spread: cf | $cf.spread,
+         isFloat: cf | $cf.isFloat
+      ])->extend(~jk: cf | 1);
+   let scenarios = pricing::PrCurveKnot.all()
+      ->project(~[scenarioId: k | $k.scenarioId])
+      ->distinct()
+      ->extend(~sjk: s | 1);
+   let swaptions = pricing::PrSwaption.all()->project(~[
+      sTradeId: s | $s.tradeId,
+      currency: s | $s.currency,
+      sDiscCurve: s | $s.discountCurveId,
+      volSurfaceId: s | $s.volSurfaceId,
+      expiryT: s | $s.expiryT,
+      settleT: s | $s.settleT,
+      swapTenorT: s | $s.swapTenorT,
+      cashFreq: s | $s.cashFreq,
+      nPeriods: s | $s.nPeriods,
+      settlementType: s | $s.settlementType,
+      strike: s | $s.strike,
+      notional: s | $s.notional,
+      isPayer: s | $s.isPayer,
+      payReceive: s | $s.payReceive
+   ])->extend(~wjk: s | 1);
+   let swpScen = $swaptions->join($scenarios, meta::pure::functions::relation::JoinKind.INNER, {l, r | $l.wjk == $r.sjk});
+   let cfScen = $swpCfs->join($scenarios, meta::pure::functions::relation::JoinKind.INNER, {l, r | $l.jk == $r.sjk});
+   let discTargets = $cfScen->project(~[scenarioId: x | $x.scenarioId, curveId: x | $x.discountCurveId, t: x | $x.payT])->distinct();
+   let settleTargets = $swpScen->project(~[scenarioId: x | $x.scenarioId, curveId: x | $x.sDiscCurve, t: x | $x.settleT])->distinct();
+   let startTargets = $cfScen->filter(x | $x.isFloat)->project(~[scenarioId: x | $x.scenarioId, curveId: x | $x.projCurveId, t: x | $x.accrualStartT])->distinct();
+   let endTargets = $cfScen->filter(x | $x.isFloat)->project(~[scenarioId: x | $x.scenarioId, curveId: x | $x.projCurveId, t: x | $x.accrualEndT])->distinct();
+   let allTargets = $discTargets->concatenate($settleTargets)->concatenate($startTargets)->concatenate($endTargets)->distinct();
+   let dfs = pricing::curveDiscountFactors($allTargets);
+   let withDfPay = $cfScen->join(
+      $dfs->project(~[dScen: x | $x.scenarioId, dCurve: x | $x.curveId, dT: x | $x.t, dfPay: x | $x.df]),
+      meta::pure::functions::relation::JoinKind.INNER,
+      {l, r | ($l.scenarioId == $r.dScen) && ($l.discountCurveId == $r.dCurve) && ($l.payT == $r.dT)}
+   );
+   let withDfStart = $withDfPay->join(
+      $dfs->project(~[sScen: x | $x.scenarioId, sCurve: x | $x.curveId, sT: x | $x.t, dfStart: x | $x.df]),
+      meta::pure::functions::relation::JoinKind.LEFT,
+      {l, r | ($l.scenarioId == $r.sScen) && ($l.projCurveId == $r.sCurve) && ($l.accrualStartT == $r.sT)}
+   );
+   let withDfEnd = $withDfStart->join(
+      $dfs->project(~[eScen: x | $x.scenarioId, eCurve: x | $x.curveId, eT: x | $x.t, dfEnd: x | $x.df]),
+      meta::pure::functions::relation::JoinKind.LEFT,
+      {l, r | ($l.scenarioId == $r.eScen) && ($l.projCurveId == $r.eCurve) && ($l.accrualEndT == $r.eT)}
+   );
+   let legAgg = $withDfEnd
+      ->extend(~[
+         annTerm: x | if($x.isFloat, |0.0, |$x.dcf * $x.dfPay),
+         fltTerm: x | if($x.isFloat, |$x.dcf * (((($x.dfStart->toOne() / $x.dfEnd->toOne()) - 1.0) / $x.dcf) + $x.spread) * $x.dfPay, |0.0)
+      ])
+      ->groupBy(
+         ~[scenarioId, tradeId],
+         ~[
+            physAnnuity: x | $x.annTerm: y | $y->sum(),
+            floatPv: x | $x.fltTerm: y | $y->sum()
+         ]
+      )
+      ->extend(~fwdRate: x | $x.floatPv->toOne() / $x.physAnnuity->toOne());
+
+   let fixedPeriods = pricing::PrCashflow.all()
+      ->filter(cf | ($cf.instrumentType == 'SWAPTION_UNDERLYING') && !$cf.isFloat)
+      ->project(~[pTradeId: cf | $cf.tradeId, pIdx: cf | $cf.cfIdx]);
+   let swpWithLegs = $legAgg->join(
+      $swpScen->project(~[
+         sScenarioId: r | $r.scenarioId,
+         sTradeId: r | $r.sTradeId,
+         currency: r | $r.currency,
+         sDiscCurve: r | $r.sDiscCurve,
+         volSurfaceId: r | $r.volSurfaceId,
+         expiryT: r | $r.expiryT,
+         settleT: r | $r.settleT,
+         swapTenorT: r | $r.swapTenorT,
+         cashFreq: r | $r.cashFreq,
+         nPeriods: r | $r.nPeriods,
+         settlementType: r | $r.settlementType,
+         strike: r | $r.strike,
+         notional: r | $r.notional,
+         isPayer: r | $r.isPayer,
+         payReceive: r | $r.payReceive
+      ]),
+      meta::pure::functions::relation::JoinKind.INNER,
+      {l, r | ($l.scenarioId == $r.sScenarioId) && ($l.tradeId == $r.sTradeId)}
+   );
+   let withSettleDf = $swpWithLegs->join(
+      $dfs->project(~[stScen: x | $x.scenarioId, stCurve: x | $x.curveId, stT: x | $x.t, dfSettle: x | $x.df]),
+      meta::pure::functions::relation::JoinKind.INNER,
+      {l, r | ($l.scenarioId == $r.stScen) && ($l.sDiscCurve == $r.stCurve) && ($l.settleT == $r.stT)}
+   );
+   let rowCashAgg = $withSettleDf
+      ->join($fixedPeriods, meta::pure::functions::relation::JoinKind.INNER, {l, r | $l.tradeId == $r.pTradeId})
+      ->extend(~cashTerm: x | (1.0 / $x.cashFreq) * (1.0 + ($x.fwdRate / $x.cashFreq))->pow(-($x.pIdx + 1.0)))
+      ->groupBy(
+         ~[scenarioId, tradeId, currency, volSurfaceId, expiryT, swapTenorT, settlementType, strike, notional, isPayer, payReceive, physAnnuity, fwdRate, dfSettle],
+         ~[cashAnnuityRaw: x | $x.cashTerm: y | $y->sum()]
+      );
+   let volTargets = $rowCashAgg->project(~[
+      scenarioId: x | $x.scenarioId,
+      volSurfaceId: x | $x.volSurfaceId,
+      expiryT: x | $x.expiryT,
+      swapTenorT: x | $x.swapTenorT
+   ])->distinct();
+   let vols = pricing::volInterpolate($volTargets);
+   let withVol = $rowCashAgg->join(
+      $vols->project(~[vScen: v | $v.scenarioId, vSurf: v | $v.volSurfaceId, vExp: v | $v.expiryT, vTen: v | $v.swapTenorT, vol: v | $v.vol]),
+      meta::pure::functions::relation::JoinKind.INNER,
+      {l, r | ($l.scenarioId == $r.vScen) && ($l.volSurfaceId == $r.vSurf) && ($l.expiryT == $r.vExp) && ($l.swapTenorT == $r.vTen)}
+   );
+   $withVol
+      ->extend(~effAnnuity: x | if($x.settlementType == 'CASH', |$x.dfSettle * $x.cashAnnuityRaw->toOne()->cast(@Float), |$x.physAnnuity->toOne()))
+      ->project(~[
+         scenarioId: x | $x.scenarioId,
+         tradeId: x | $x.tradeId,
+         currency: x | $x.currency,
+         annuity: x | $x.effAnnuity,
+         fwdRate: x | $x.fwdRate,
+         vol: x | $x.vol,
+         pv: x | pricing::black76SwaptionPv($x.effAnnuity, $x.fwdRate, $x.strike, $x.expiryT, $x.vol, $x.notional, $x.isPayer, $x.payReceive)
+      ]);
 }

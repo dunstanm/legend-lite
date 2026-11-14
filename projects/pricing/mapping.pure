@@ -45,4 +45,42 @@ Mapping pricing::Mapping
       isFloat: [pricing::Store]PR_CASHFLOW.IS_FLOAT,
       payReceive: [pricing::Store]PR_CASHFLOW.PAY_RECEIVE
    }
+
+   pricing::PrSwaption[prSwaption]: Relational
+   {
+      ~primaryKey ( [pricing::Store]PR_SWAPTION.TRADE_ID )
+      ~mainTable [pricing::Store]PR_SWAPTION
+      tradeId: [pricing::Store]PR_SWAPTION.TRADE_ID,
+      currency: [pricing::Store]PR_SWAPTION.CCY,
+      discountCurveId: [pricing::Store]PR_SWAPTION.DISCOUNT_CURVE_ID,
+      projCurveId: [pricing::Store]PR_SWAPTION.PROJ_CURVE_ID,
+      volSurfaceId: [pricing::Store]PR_SWAPTION.VOL_SURFACE_ID,
+      expiryT: [pricing::Store]PR_SWAPTION.EXPIRY_T,
+      settleT: [pricing::Store]PR_SWAPTION.SETTLE_T,
+      swapTenorT: [pricing::Store]PR_SWAPTION.SWAP_TENOR_T,
+      cashFreq: [pricing::Store]PR_SWAPTION.CASH_FREQ,
+      nPeriods: [pricing::Store]PR_SWAPTION.N_PERIODS,
+      settlementType: [pricing::Store]PR_SWAPTION.SETTLEMENT_TYPE,
+      strike: [pricing::Store]PR_SWAPTION.STRIKE,
+      notional: [pricing::Store]PR_SWAPTION.NOTIONAL,
+      isPayer: [pricing::Store]PR_SWAPTION.IS_PAYER,
+      payReceive: [pricing::Store]PR_SWAPTION.PAY_RECEIVE
+   }
+
+   pricing::PrVolPoint[prVolPoint]: Relational
+   {
+      ~primaryKey
+      (
+         [pricing::Store]PR_VOL_POINT.SCENARIO_ID,
+         [pricing::Store]PR_VOL_POINT.VOL_SURFACE_ID,
+         [pricing::Store]PR_VOL_POINT.POINT_IDX
+      )
+      ~mainTable [pricing::Store]PR_VOL_POINT
+      scenarioId: [pricing::Store]PR_VOL_POINT.SCENARIO_ID,
+      volSurfaceId: [pricing::Store]PR_VOL_POINT.VOL_SURFACE_ID,
+      pointIdx: [pricing::Store]PR_VOL_POINT.POINT_IDX,
+      expiryT: [pricing::Store]PR_VOL_POINT.EXPIRY_T,
+      swapTenorT: [pricing::Store]PR_VOL_POINT.SWAP_TENOR_T,
+      vol: [pricing::Store]PR_VOL_POINT.VOL
+   }
 )

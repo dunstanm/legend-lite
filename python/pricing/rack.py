@@ -78,6 +78,53 @@ class FraSpec:
     day_count: str = "ACT/360"
 
 
+@dataclass(frozen=True)
+class SwaptionSpec:
+    trade_id: str
+    ccy: str
+    discount_curve_id: str
+    proj_curve_id: str
+    vol_surface_id: str
+    expiry_months: int
+    swap_tenor_months: int
+    freq_months: int
+    notional: float
+    strike: float
+    is_payer: bool = True
+    pay_receive: float = 1.0
+    day_count: str = "ACT/365F"
+    settlement_type: str = "PHYSICAL"
+
+
+@dataclass(frozen=True)
+class SwaptionRow:
+    trade_id: str
+    ccy: str
+    discount_curve_id: str
+    proj_curve_id: str
+    vol_surface_id: str
+    expiry_t: float
+    settle_t: float
+    swap_tenor_t: float
+    cash_freq: float
+    n_periods: float
+    settlement_type: str
+    strike: float
+    notional: float
+    is_payer: bool
+    pay_receive: float
+
+
+@dataclass(frozen=True)
+class VolPoint:
+    scenario_id: str
+    vol_surface_id: str
+    point_idx: int
+    expiry_t: float
+    swap_tenor_t: float
+    vol: float
+
+
 def _add_months(d: dt.date, months: int) -> dt.date:
     month0 = d.month - 1 + months
     year = d.year + month0 // 12
@@ -243,6 +290,61 @@ def expand_fra_to_cashflows(
             pay_receive=float_sign,
         ),
     ]
+
+
+def expand_swaption_to_rows(
+    spec: SwaptionSpec,
+    valuation_date: dt.date,
+    holidays: set[dt.date],
+) -> tuple[SwaptionRow, list[CashflowRow]]:
+    """Expand a European swaption into its PR_SWAPTION row + underlying PR_CASHFLOW legs."""
+    expiry_date = adjust_date(_add_months(valuation_date, spec.expiry_months), holidays, "MOD_FOLLOWING")
+    expiry_t = year_fraction(valuation_date, expiry_date, "ACT/365F")
+    swap_tenor_t = spec.swap_tenor_months / 12.0
+    n_periods = spec.swap_tenor_months // spec.freq_months
+    cash_freq = 12.0 / spec.freq_months
+    sw_row = SwaptionRow(
+        trade_id=spec.trade_id,
+        ccy=spec.ccy,
+        discount_curve_id=spec.discount_curve_id,
+        proj_curve_id=spec.proj_curve_id,
+        vol_surface_id=spec.vol_surface_id,
+        expiry_t=expiry_t,
+        settle_t=expiry_t,
+        swap_tenor_t=swap_tenor_t,
+        cash_freq=cash_freq,
+        n_periods=float(n_periods),
+        settlement_type=spec.settlement_type,
+        strike=spec.strike,
+        notional=spec.notional,
+        is_payer=spec.is_payer,
+        pay_receive=spec.pay_receive,
+    )
+    unadj_dates = [_add_months(expiry_date, i * spec.freq_months) for i in range(n_periods + 1)]
+    adj_dates = [adjust_date(d, holidays, "MOD_FOLLOWING") for d in unadj_dates]
+    cfs: list[CashflowRow] = []
+    for i in range(n_periods):
+        s_d, e_d = adj_dates[i], adj_dates[i + 1]
+        t_start = year_fraction(valuation_date, s_d, "ACT/365F")
+        t_end = year_fraction(valuation_date, e_d, "ACT/365F")
+        dcf = year_fraction(s_d, e_d, spec.day_count)
+        cfs.append(CashflowRow(
+            trade_id=spec.trade_id, leg_id="FIXED", cf_idx=i,
+            instrument_type="SWAPTION_UNDERLYING", ccy=spec.ccy,
+            discount_curve_id=spec.discount_curve_id, proj_curve_id=spec.proj_curve_id,
+            accrual_start_t=t_start, accrual_end_t=t_end, pay_t=t_end,
+            dcf=dcf, notional=spec.notional, fixed_rate=spec.strike,
+            spread=0.0, is_float=False, pay_receive=1.0,
+        ))
+        cfs.append(CashflowRow(
+            trade_id=spec.trade_id, leg_id="FLOAT", cf_idx=i,
+            instrument_type="SWAPTION_UNDERLYING", ccy=spec.ccy,
+            discount_curve_id=spec.discount_curve_id, proj_curve_id=spec.proj_curve_id,
+            accrual_start_t=t_start, accrual_end_t=t_end, pay_t=t_end,
+            dcf=dcf, notional=spec.notional, fixed_rate=0.0,
+            spread=0.0, is_float=True, pay_receive=1.0,
+        ))
+    return sw_row, cfs
 
 
 def _ref_df(knots: Sequence[tuple[float, float]], method: str, t: float) -> float:
@@ -476,5 +578,164 @@ def run_pure_pricing_duckdb(
 
     return {
         (row["scenarioId"], row["tradeId"]): float(row["npv"])
+        for row in out.to_pylist()
+    }
+
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _interp_vol_py(vol_pts: Sequence[VolPoint], scen: str, surf: str, exp_t: float, ten_t: float) -> float:
+    pts = [v for v in vol_pts if v.scenario_id == scen and v.vol_surface_id == surf]
+    if not pts:
+        pts = [v for v in vol_pts if v.scenario_id == "BASE" and v.vol_surface_id == surf]
+    exps = sorted({v.expiry_t for v in pts})
+    tens = sorted({v.swap_tenor_t for v in pts})
+    e0 = max([e for e in exps if e <= exp_t], default=exps[0])
+    e1 = min([e for e in exps if e >= exp_t], default=exps[-1])
+    t0 = max([t for t in tens if t <= ten_t], default=tens[0])
+    t1 = min([t for t in tens if t >= ten_t], default=tens[-1])
+    grid = {(v.expiry_t, v.swap_tenor_t): v.vol for v in pts}
+    we = 0.0 if e1 <= e0 else min(1.0, max(0.0, (exp_t - e0) / (e1 - e0)))
+    wt = 0.0 if t1 <= t0 else min(1.0, max(0.0, (ten_t - t0) / (t1 - t0)))
+    r0 = (1.0 - wt) * grid[(e0, t0)] + wt * grid[(e0, t1)]
+    r1 = (1.0 - wt) * grid[(e1, t0)] + wt * grid[(e1, t1)]
+    return (1.0 - we) * r0 + we * r1
+
+
+def price_swaptions_python(
+    swaptions: Sequence[SwaptionRow],
+    cashflows: Sequence[CashflowRow],
+    knots: Sequence[CurveKnot],
+    vol_points: Sequence[VolPoint],
+) -> dict[tuple[str, str], float]:
+    """Python float Black-76 swaption reference oracle: returns {(scenario_id, trade_id): pv}."""
+    by_scen_curve: dict[tuple[str, str], tuple[str, list[tuple[float, float]]]] = {}
+    scenarios: set[str] = set()
+    for k in sorted(knots, key=lambda x: (x.scenario_id, x.curve_id, x.knot_t)):
+        scenarios.add(k.scenario_id)
+        key = (k.scenario_id, k.curve_id)
+        if key not in by_scen_curve:
+            by_scen_curve[key] = (k.interp_method, [])
+        by_scen_curve[key][1].append((k.knot_t, k.zero_rate))
+
+    cfs_by_trade: dict[str, list[CashflowRow]] = {}
+    for cf in cashflows:
+        if cf.instrument_type == "SWAPTION_UNDERLYING":
+            cfs_by_trade.setdefault(cf.trade_id, []).append(cf)
+
+    out: dict[tuple[str, str], float] = {}
+    for scen in sorted(scenarios):
+        for sw in swaptions:
+            ann = 0.0
+            flt_pv = 0.0
+            d_method, d_pts = by_scen_curve[(scen, sw.discount_curve_id)]
+            p_method, p_pts = by_scen_curve[(scen, sw.proj_curve_id)]
+            for cf in cfs_by_trade[sw.trade_id]:
+                df_pay = _ref_df(d_pts, d_method, cf.pay_t)
+                if cf.is_float:
+                    df_s = _ref_df(p_pts, p_method, cf.accrual_start_t)
+                    df_e = _ref_df(p_pts, p_method, cf.accrual_end_t)
+                    fwd = ((df_s / df_e) - 1.0) / cf.dcf + cf.spread
+                    flt_pv += cf.dcf * fwd * df_pay
+                else:
+                    ann += cf.dcf * df_pay
+            fwd_rate = flt_pv / ann
+            if sw.settlement_type == "CASH":
+                df_settle = _ref_df(d_pts, d_method, sw.settle_t)
+                if abs(fwd_rate) < 1e-8:
+                    c_ann = (sw.n_periods / sw.cash_freq) - (
+                        sw.n_periods * (sw.n_periods + 1.0) / (2.0 * sw.cash_freq * sw.cash_freq)
+                    ) * fwd_rate
+                else:
+                    c_ann = (1.0 - (1.0 + fwd_rate / sw.cash_freq) ** (-sw.n_periods)) / fwd_rate
+                eff_ann = df_settle * c_ann
+            else:
+                eff_ann = ann
+            vol = _interp_vol_py(vol_points, scen, sw.vol_surface_id, sw.expiry_t, sw.swap_tenor_t)
+            std = vol * math.sqrt(sw.expiry_t)
+            if std <= 1e-12:
+                opt = max(fwd_rate - sw.strike, 0.0) if sw.is_payer else max(sw.strike - fwd_rate, 0.0)
+            else:
+                d1 = (math.log(fwd_rate / sw.strike) + 0.5 * std * std) / std
+                d2 = d1 - std
+                if sw.is_payer:
+                    opt = fwd_rate * _norm_cdf(d1) - sw.strike * _norm_cdf(d2)
+                else:
+                    opt = sw.strike * _norm_cdf(-d2) - fwd_rate * _norm_cdf(-d1)
+            out[(scen, sw.trade_id)] = sw.pay_receive * sw.notional * eff_ann * opt
+    return out
+
+
+def _swaption_tables_to_arrow(
+    swaptions: Sequence[SwaptionRow],
+    vol_points: Sequence[VolPoint],
+) -> tuple[pa.Table, pa.Table]:
+    swp_tbl = pa.table({
+        "TRADE_ID": pa.array([s.trade_id for s in swaptions], type=pa.string()),
+        "CCY": pa.array([s.ccy for s in swaptions], type=pa.string()),
+        "DISCOUNT_CURVE_ID": pa.array([s.discount_curve_id for s in swaptions], type=pa.string()),
+        "PROJ_CURVE_ID": pa.array([s.proj_curve_id for s in swaptions], type=pa.string()),
+        "VOL_SURFACE_ID": pa.array([s.vol_surface_id for s in swaptions], type=pa.string()),
+        "EXPIRY_T": pa.array([s.expiry_t for s in swaptions], type=pa.float64()),
+        "SETTLE_T": pa.array([s.settle_t for s in swaptions], type=pa.float64()),
+        "SWAP_TENOR_T": pa.array([s.swap_tenor_t for s in swaptions], type=pa.float64()),
+        "CASH_FREQ": pa.array([s.cash_freq for s in swaptions], type=pa.float64()),
+        "N_PERIODS": pa.array([s.n_periods for s in swaptions], type=pa.float64()),
+        "SETTLEMENT_TYPE": pa.array([s.settlement_type for s in swaptions], type=pa.string()),
+        "STRIKE": pa.array([s.strike for s in swaptions], type=pa.float64()),
+        "NOTIONAL": pa.array([s.notional for s in swaptions], type=pa.float64()),
+        "IS_PAYER": pa.array([s.is_payer for s in swaptions], type=pa.bool_()),
+        "PAY_RECEIVE": pa.array([s.pay_receive for s in swaptions], type=pa.float64()),
+    })
+    vol_tbl = pa.table({
+        "SCENARIO_ID": pa.array([v.scenario_id for v in vol_points], type=pa.string()),
+        "VOL_SURFACE_ID": pa.array([v.vol_surface_id for v in vol_points], type=pa.string()),
+        "POINT_IDX": pa.array([v.point_idx for v in vol_points], type=pa.int16()),
+        "EXPIRY_T": pa.array([v.expiry_t for v in vol_points], type=pa.float64()),
+        "SWAP_TENOR_T": pa.array([v.swap_tenor_t for v in vol_points], type=pa.float64()),
+        "VOL": pa.array([v.vol for v in vol_points], type=pa.float64()),
+    })
+    return swp_tbl, vol_tbl
+
+
+def run_pure_swaption_pricing_duckdb(
+    knots: Sequence[CurveKnot],
+    cashflows: Sequence[CashflowRow],
+    swaptions: Sequence[SwaptionRow],
+    vol_points: Sequence[VolPoint],
+    projects_dir: Path | None = None,
+    mode: str = "function",
+) -> dict[tuple[str, str], float]:
+    """Execute projects/pricing swaption pricer ('function' or 'row_sum') on DuckDB."""
+    if projects_dir is None:
+        projects_dir = Path(__file__).resolve().parents[2] / "projects" / "pricing"
+    knot_tbl, cf_tbl = _tables_to_arrow(knots, cashflows)
+    swp_tbl, vol_tbl = _swaption_tables_to_arrow(swaptions, vol_points)
+
+    conn = duckdb.connect(":memory:")
+    try:
+        conn.register("_arrow_knots", knot_tbl)
+        conn.register("_arrow_cfs", cf_tbl)
+        conn.register("_arrow_swps", swp_tbl)
+        conn.register("_arrow_vols", vol_tbl)
+        conn.execute("CREATE TABLE PR_CURVE_KNOT AS SELECT * FROM _arrow_knots")
+        conn.execute("CREATE TABLE PR_CASHFLOW AS SELECT * FROM _arrow_cfs")
+        conn.execute("CREATE TABLE PR_SWAPTION AS SELECT * FROM _arrow_swps")
+        conn.execute("CREATE TABLE PR_VOL_POINT AS SELECT * FROM _arrow_vols")
+
+        frames = ll.Frames(conn)
+        model_text = _load_pricing_pure_sources(projects_dir)
+        fn = "pricing::swaptionPvs()" if mode == "function" else "pricing::swaptionPvsRowSum()"
+        with ll.HeldModel(model_text) as held:
+            query = f"{fn}->sort([~scenarioId->ascending(), ~tradeId->ascending()])"
+            plan = held.plan(ll.parse(query), "pricing::DuckDbRuntime")
+            out = frames.run(plan)
+    finally:
+        conn.close()
+
+    return {
+        (row["scenarioId"], row["tradeId"]): float(row["pv"])
         for row in out.to_pylist()
     }
