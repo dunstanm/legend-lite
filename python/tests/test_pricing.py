@@ -1,5 +1,6 @@
 """Parity and SOD-expansion tests for python/pricing + projects/pricing."""
 
+import dataclasses
 import datetime as dt
 import os
 import time
@@ -11,12 +12,16 @@ from pricing.rack import (
     SwapSpec,
     SwaptionSpec,
     VolPoint,
+    XccyBasisSwapSpec,
     build_curve_scenarios,
     compute_bump_dv01_python,
     expand_fra_to_cashflows,
     expand_swap_to_cashflows,
     expand_swaption_to_rows,
+    expand_xccy_basis_swap_to_cashflows,
+    fit_curve_from_cashflows,
     fit_zero_curve,
+    next_imm_dates,
     price_cashflows_python,
     price_swaptions_python,
     run_pure_pricing_duckdb,
@@ -139,12 +144,12 @@ class PricingRackTests(unittest.TestCase):
 
         # 2x3 vol surface grid in (expiryT, swapTenorT)
         vol_points = [
-            VolPoint("BASE", "USD_SWP_VOL", 0, 0.5, 1.0, 0.24),
-            VolPoint("BASE", "USD_SWP_VOL", 1, 0.5, 2.0, 0.22),
-            VolPoint("BASE", "USD_SWP_VOL", 2, 0.5, 5.0, 0.20),
-            VolPoint("BASE", "USD_SWP_VOL", 3, 2.0, 1.0, 0.21),
-            VolPoint("BASE", "USD_SWP_VOL", 4, 2.0, 2.0, 0.19),
-            VolPoint("BASE", "USD_SWP_VOL", 5, 2.0, 5.0, 0.18),
+            VolPoint("BASE", "USD_SWP_VOL", 0, 0.5, 1.0, 0.0096, beta=0.0),
+            VolPoint("BASE", "USD_SWP_VOL", 1, 0.5, 2.0, 0.0088, beta=0.0),
+            VolPoint("BASE", "USD_SWP_VOL", 2, 0.5, 5.0, 0.0080, beta=0.0),
+            VolPoint("BASE", "USD_SWP_VOL", 3, 2.0, 1.0, 0.0084, beta=0.0),
+            VolPoint("BASE", "USD_SWP_VOL", 4, 2.0, 2.0, 0.0076, beta=0.0),
+            VolPoint("BASE", "USD_SWP_VOL", 5, 2.0, 5.0, 0.0072, beta=0.0),
         ]
 
         # Build 500 swaptions (covering in-between expiries/tenors so bilinear vol interp is exercised)
@@ -204,6 +209,266 @@ class PricingRackTests(unittest.TestCase):
             f"[swaption_test] swaptions=500 (250 PHYS + 250 CASH) scenarios=9 rows={len(fn_pvs)} "
             f"py_ms={py_ms:.1f} fn_total_ms={fn_ms:.1f} row_sum_total_ms={rs_ms:.1f} "
             f"max_fn_diff={max_fn_diff:.2e} max_rs_diff={max_rs_diff:.2e} dual_diff={max_dual_diff:.2e}"
+        )
+
+    def test_sabr_vol_smile_pv_ad_dv01_and_alpha_vega(self) -> None:
+        pricing_dir = _find_pricing_dir()
+        base_knots = fit_zero_curve(self.benchmarks, self.val_date, self.base_holidays, "USD_OIS", "LOG_LINEAR_DF")
+        scen_knots = build_curve_scenarios(base_knots, bump_bp=1.0)
+
+        # 3x3 SABR surface: (alpha, beta, rho, nu) per grid knot
+        expiries = [0.5, 2.0, 5.0]
+        tenors = [1.0, 3.0, 5.0]
+        vol_points = []
+        idx = 0
+        for ie, e in enumerate(expiries):
+            for it, t in enumerate(tenors):
+                vol_points.append(VolPoint(
+                    "BASE", "USD_SWP_VOL", idx, e, t,
+                    vol=0.044 - 0.002 * ie - 0.001 * it,  # alpha (CEV backbone)
+                    beta=0.5 + 0.05 * it,
+                    rho=-0.35 + 0.05 * ie,
+                    nu=0.30 + 0.05 * ie + 0.02 * it,
+                ))
+                idx += 1
+
+        swaptions = []
+        swp_cfs = []
+        for i in range(200):
+            exp_m = [6, 9, 15, 24, 42][i % 5]
+            ten_m = [12, 24, 36, 48, 60][i % 5]
+            spec = SwaptionSpec(
+                trade_id=f"SABR_{i:03d}",
+                ccy="USD",
+                discount_curve_id="USD_OIS",
+                proj_curve_id="USD_OIS",
+                vol_surface_id="USD_SWP_VOL",
+                expiry_months=exp_m,
+                swap_tenor_months=ten_m,
+                freq_months=6,
+                notional=1_000_000.0 * ((i % 3) + 1),
+                strike=0.028 + 0.002 * (i % 15),
+                is_payer=(i % 2 == 0),
+                pay_receive=1.0 if (i % 3 != 0) else -1.0,
+                settlement_type="PHYSICAL" if (i % 2 == 0) else "CASH",
+            )
+            swp_row, cfs = expand_swaption_to_rows(spec, self.val_date, self.base_holidays)
+            swaptions.append(swp_row)
+            swp_cfs.extend(cfs)
+
+        # 1. PV parity (Pure function + row_sum vs Python SABR)
+        py_pvs = price_swaptions_python(swaptions, swp_cfs, scen_knots, vol_points)
+        sql_fn_pvs = run_pure_swaption_pricing_duckdb(
+            scen_knots, swp_cfs, swaptions, vol_points, projects_dir=pricing_dir, mode="function"
+        )
+        sql_rs_pvs = run_pure_swaption_pricing_duckdb(
+            scen_knots, swp_cfs, swaptions, vol_points, projects_dir=pricing_dir, mode="row_sum"
+        )
+        max_pv_diff = max(abs(py_pvs[k] - sql_fn_pvs[k]) for k in py_pvs)
+        max_rs_diff = max(abs(py_pvs[k] - sql_rs_pvs[k]) for k in py_pvs)
+        self.assertLess(max_pv_diff, 1e-8, f"SABR PV fn diff={max_pv_diff}")
+        self.assertLess(max_rs_diff, 1e-8, f"SABR PV row_sum diff={max_rs_diff}")
+        print(
+            f"[sabr_test] swaptions=200 (100 PHYS + 100 CASH) pv_diff={max_pv_diff:.2e} rs_diff={max_rs_diff:.2e}"
+        )
+
+    def test_pluggable_vol_model_switching_flat_normal_vs_sabr(self) -> None:
+        pricing_dir = _find_pricing_dir()
+        base_knots = fit_zero_curve(self.benchmarks, self.val_date, self.base_holidays, "USD_OIS", "LOG_LINEAR_DF")
+        scen_knots = build_curve_scenarios(base_knots, bump_bp=1.0)
+
+        # Same PR_VOL_POINT table carries both normal vol (alpha) and SABR smile (beta, rho, nu)
+        vol_points = [
+            VolPoint("BASE", "USD_SWP_VOL", 0, 0.5, 1.0, vol=0.0088, beta=0.85, rho=-0.30, nu=0.35),
+            VolPoint("BASE", "USD_SWP_VOL", 1, 0.5, 5.0, vol=0.0080, beta=0.85, rho=-0.30, nu=0.35),
+            VolPoint("BASE", "USD_SWP_VOL", 2, 2.0, 1.0, vol=0.0084, beta=0.85, rho=-0.30, nu=0.35),
+            VolPoint("BASE", "USD_SWP_VOL", 3, 2.0, 5.0, vol=0.0076, beta=0.85, rho=-0.30, nu=0.35),
+        ]
+        swaptions = []
+        swp_cfs = []
+        for i in range(40):
+            spec = SwaptionSpec(
+                trade_id=f"SWP_MOD_{i:02d}",
+                ccy="USD",
+                discount_curve_id="USD_OIS",
+                proj_curve_id="USD_OIS",
+                vol_surface_id="USD_SWP_VOL",
+                expiry_months=[6, 12, 18, 24][i % 4],
+                swap_tenor_months=[12, 24, 36, 60][i % 4],
+                freq_months=6,
+                notional=1_000_000.0,
+                strike=0.035 + 0.002 * (i % 6),
+                is_payer=(i % 2 == 0),
+                pay_receive=1.0,
+                settlement_type="PHYSICAL" if (i % 2 == 0) else "CASH",
+            )
+            r, c = expand_swaption_to_rows(spec, self.val_date, self.base_holidays)
+            swaptions.append(r)
+            swp_cfs.extend(c)
+
+        # 1. Switch to flatNormalVolInterpolate / flatNormalVolKernel on the same table
+        flat_pvs = run_pure_swaption_pricing_duckdb(
+            base_knots, swp_cfs, swaptions, vol_points, projects_dir=pricing_dir, vol_model="flat_normal"
+        )
+        sabr_pvs = run_pure_swaption_pricing_duckdb(
+            base_knots, swp_cfs, swaptions, vol_points, projects_dir=pricing_dir, vol_model="sabr"
+        )
+        # Flat-normal ignores beta/rho/nu so PVs differ materially from SABR
+        max_model_gap = max(abs(flat_pvs[k] - sabr_pvs[k]) for k in flat_pvs)
+        self.assertGreater(max_model_gap, 100.0)
+
+        # Verify flat_normal matches Python oracle with beta=0, rho=0, nu=0
+        flat_vols = [dataclasses.replace(vp, beta=0.0, rho=0.0, nu=0.0) for vp in vol_points]
+        py_flat_pvs = price_swaptions_python(swaptions, swp_cfs, base_knots, flat_vols)
+        max_flat_pv_diff = max(abs(flat_pvs[k] - py_flat_pvs[k]) for k in flat_pvs)
+        self.assertLess(max_flat_pv_diff, 1e-8)
+        print(
+            f"[pluggable_vol_model] swaptions=40 flat_vs_sabr_pv_gap={max_model_gap:.1f} "
+            f"flat_pv_diff={max_flat_pv_diff:.2e}"
+        )
+
+    def test_negative_rate_swaption_bachelier_and_normal_sabr(self) -> None:
+        pricing_dir = _find_pricing_dir()
+        neg_benchmarks = [
+            SwapSpec("BM_6M", "OIS", "EUR", "EUR_OIS", "EUR_OIS", self.val_date, 6, 6, 1_000_000.0, -0.015),
+            SwapSpec("BM_1Y", "OIS", "EUR", "EUR_OIS", "EUR_OIS", self.val_date, 12, 6, 1_000_000.0, -0.012),
+            SwapSpec("BM_2Y", "OIS", "EUR", "EUR_OIS", "EUR_OIS", self.val_date, 24, 6, 1_000_000.0, -0.008),
+            SwapSpec("BM_3Y", "OIS", "EUR", "EUR_OIS", "EUR_OIS", self.val_date, 36, 6, 1_000_000.0, -0.004),
+            SwapSpec("BM_5Y", "OIS", "EUR", "EUR_OIS", "EUR_OIS", self.val_date, 60, 6, 1_000_000.0, 0.002),
+            SwapSpec("BM_7Y", "OIS", "EUR", "EUR_OIS", "EUR_OIS", self.val_date, 84, 6, 1_000_000.0, 0.006),
+            SwapSpec("BM_10Y", "OIS", "EUR", "EUR_OIS", "EUR_OIS", self.val_date, 120, 6, 1_000_000.0, 0.010),
+        ]
+        base_knots = fit_zero_curve(neg_benchmarks, self.val_date, self.base_holidays, "EUR_OIS", "LOG_LINEAR_DF")
+        scen_knots = build_curve_scenarios(base_knots, bump_bp=1.0)
+
+        # Normal SABR (beta=0.0) supports negative forwards & strikes cleanly
+        vol_points = [
+            VolPoint("BASE", "EUR_SWP_VOL", 0, 0.5, 1.0, vol=0.0075, beta=0.0, rho=-0.20, nu=0.25),
+            VolPoint("BASE", "EUR_SWP_VOL", 1, 0.5, 5.0, vol=0.0070, beta=0.0, rho=-0.20, nu=0.25),
+            VolPoint("BASE", "EUR_SWP_VOL", 2, 2.0, 1.0, vol=0.0072, beta=0.0, rho=-0.20, nu=0.25),
+            VolPoint("BASE", "EUR_SWP_VOL", 3, 2.0, 5.0, vol=0.0068, beta=0.0, rho=-0.20, nu=0.25),
+        ]
+        swaptions = []
+        swp_cfs = []
+        for i in range(20):
+            spec = SwaptionSpec(
+                trade_id=f"NEG_SWP_{i:02d}",
+                ccy="EUR",
+                discount_curve_id="EUR_OIS",
+                proj_curve_id="EUR_OIS",
+                vol_surface_id="EUR_SWP_VOL",
+                expiry_months=[6, 12, 18, 24][i % 4],
+                swap_tenor_months=[12, 24, 36, 60][i % 4],
+                freq_months=6,
+                notional=1_000_000.0,
+                strike=-0.012 + 0.003 * (i % 6),  # negative to positive strikes
+                is_payer=(i % 2 == 0),
+                pay_receive=1.0 if (i % 3 != 0) else -1.0,
+                settlement_type="PHYSICAL" if (i % 2 == 0) else "CASH",
+            )
+            r, c = expand_swaption_to_rows(spec, self.val_date, self.base_holidays)
+            swaptions.append(r)
+            swp_cfs.extend(c)
+
+        py_pvs = price_swaptions_python(swaptions, swp_cfs, scen_knots, vol_points)
+        fn_pvs = run_pure_swaption_pricing_duckdb(
+            scen_knots, swp_cfs, swaptions, vol_points, projects_dir=pricing_dir, mode="function"
+        )
+        max_pv_diff = max(abs(py_pvs[k] - fn_pvs[k]) for k in py_pvs)
+        self.assertLess(max_pv_diff, 1e-8, f"Negative-rate Bachelier PV diff={max_pv_diff}")
+        print(f"[neg_rate_bachelier] swaptions=20 pv_diff={max_pv_diff:.2e}")
+
+    def test_imm_ois_and_xccy_multi_curve_skinny_table_and_ad_dv01(self) -> None:
+        pricing_dir = _find_pricing_dir()
+        imms = next_imm_dates(self.val_date, 5)  # 4 quarterly IMM 3M contracts
+
+        # 1. USD_OIS fit from IMM 3M FRAs + OIS swaps
+        usd_bm_cfs = [
+            expand_fra_to_cashflows(
+                FraSpec(f"USD_IMM_{i}", "USD", "USD_OIS", "USD_OIS", imms[i], imms[i + 1], 1_000_000.0, 0.041 + 0.0005 * i),
+                self.val_date, self.base_holidays,
+            )
+            for i in range(4)
+        ] + [
+            expand_swap_to_cashflows(
+                SwapSpec(f"USD_OIS_{m}M", "OIS", "USD", "USD_OIS", "USD_OIS", self.val_date, m, 6, 1_000_000.0, r),
+                self.val_date, self.base_holidays,
+            )
+            for m, r in [(24, 0.0430), (36, 0.0445), (60, 0.0465), (120, 0.0485)]
+        ]
+        usd_knots = fit_curve_from_cashflows(usd_bm_cfs, "USD_OIS", "LOG_LINEAR_DF")
+
+        # 2. EUR_OIS fit from IMM 3M FRAs + EUR OIS swaps
+        eur_bm_cfs = [
+            expand_fra_to_cashflows(
+                FraSpec(f"EUR_IMM_{i}", "EUR", "EUR_OIS", "EUR_OIS", imms[i], imms[i + 1], 1_000_000.0, 0.025 + 0.0005 * i),
+                self.val_date, self.base_holidays,
+            )
+            for i in range(4)
+        ] + [
+            expand_swap_to_cashflows(
+                SwapSpec(f"EUR_OIS_{m}M", "OIS", "EUR", "EUR_OIS", "EUR_OIS", self.val_date, m, 6, 1_000_000.0, r),
+                self.val_date, self.base_holidays,
+            )
+            for m, r in [(24, 0.0270), (36, 0.0285), (60, 0.0305), (120, 0.0325)]
+        ]
+        eur_knots = fit_curve_from_cashflows(eur_bm_cfs, "EUR_OIS", "LOG_LINEAR_DF")
+
+        # 3. EUR_DISC_USD fit from EUR/USD XCCY basis swaps (holding USD_OIS & EUR_OIS fixed)
+        fx_spot = 1.10
+        xccy_bm_cfs = [
+            expand_xccy_basis_swap_to_cashflows(
+                XccyBasisSwapSpec(
+                    f"XCCY_BM_{m}M", "EUR", "USD",
+                    "EUR_DISC_USD", "EUR_OIS", "USD_OIS", "USD_OIS",
+                    self.val_date, m, 6, 1_000_000.0, fx_spot, spread,
+                ),
+                self.val_date, self.base_holidays,
+            )
+            for m, spread in [(12, -0.0012), (24, -0.0015), (60, -0.0018), (120, -0.0020)]
+        ]
+        eur_disc_usd_knots = fit_curve_from_cashflows(
+            xccy_bm_cfs, "EUR_DISC_USD", "LOG_LINEAR_DF",
+            fixed_knots=usd_knots + eur_knots, initial_rate=0.026,
+        )
+
+        all_base_knots = usd_knots + eur_knots + eur_disc_usd_knots
+
+        # Verify every benchmark (IMM FRA, OIS, XCCY) prices to par
+        all_bms = usd_bm_cfs + eur_bm_cfs + xccy_bm_cfs
+        bm_flat = [cf for cfs in all_bms for cf in cfs]
+        bm_pvs = price_cashflows_python(bm_flat, all_base_knots)
+        max_bm_res = max(abs(bm_pvs[("BASE", cfs[0].trade_id)]) / cfs[0].notional for cfs in all_bms)
+        self.assertLess(max_bm_res, 1e-10, f"Multi-curve benchmark par residual={max_bm_res}")
+
+        # Build mixed portfolio (IMM FRAs + OIS swaps + XCCY basis swaps) in single skinny PR_CASHFLOW
+        portfolio_cfs = []
+        for i in range(4):
+            portfolio_cfs.extend(expand_fra_to_cashflows(
+                FraSpec(f"PF_IMM_{i}", "USD", "USD_OIS", "USD_OIS", imms[i], imms[i + 1], 5_000_000.0, 0.039 + 0.001 * i),
+                self.val_date, self.base_holidays,
+            ))
+        portfolio_cfs.extend(expand_swap_to_cashflows(
+            SwapSpec("PF_EUR_OIS_5Y", "OIS", "EUR", "EUR_OIS", "EUR_OIS", self.val_date, 60, 6, 3_000_000.0, 0.032),
+            self.val_date, self.base_holidays,
+        ))
+        portfolio_cfs.extend(expand_xccy_basis_swap_to_cashflows(
+            XccyBasisSwapSpec(
+                "PF_XCCY_5Y", "EUR", "USD",
+                "EUR_DISC_USD", "EUR_OIS", "USD_OIS", "USD_OIS",
+                self.val_date, 60, 6, 2_000_000.0, fx_spot, -0.0010,
+            ),
+            self.val_date, self.base_holidays,
+        ))
+
+        scen_knots = build_curve_scenarios(all_base_knots, bump_bp=1.0)
+        py_pvs = price_cashflows_python(portfolio_cfs, scen_knots)
+        sql_pvs = run_pure_pricing_duckdb(scen_knots, portfolio_cfs, projects_dir=pricing_dir)
+        max_pv_diff = max(abs(py_pvs[k] - sql_pvs[k]) for k in py_pvs)
+        self.assertLess(max_pv_diff, 1e-8, f"IMM+OIS+XCCY PV diff={max_pv_diff}")
+        print(
+            f"[imm_ois_xccy] curves=3 (USD_OIS, EUR_OIS, EUR_DISC_USD) trades=6 "
+            f"bm_par_res={max_bm_res:.2e} pv_diff={max_pv_diff:.2e}"
         )
 
 

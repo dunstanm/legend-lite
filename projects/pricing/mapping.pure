@@ -81,6 +81,9 @@ Mapping pricing::Mapping
       pointIdx: [pricing::Store]PR_VOL_POINT.POINT_IDX,
       expiryT: [pricing::Store]PR_VOL_POINT.EXPIRY_T,
       swapTenorT: [pricing::Store]PR_VOL_POINT.SWAP_TENOR_T,
-      vol: [pricing::Store]PR_VOL_POINT.VOL
+      vol: [pricing::Store]PR_VOL_POINT.VOL,
+      beta: [pricing::Store]PR_VOL_POINT.BETA,
+      rho: [pricing::Store]PR_VOL_POINT.RHO,
+      nu: [pricing::Store]PR_VOL_POINT.NU
    }
 )

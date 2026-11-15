@@ -20,6 +20,8 @@ from pricing.rack import (
     compute_bump_dv01_python,
     run_pure_pricing_duckdb,
     run_pure_swaption_pricing_duckdb,
+    run_pure_dv01_duckdb,
+    run_pure_vega_duckdb,
 )
 
 __all__ = [
@@ -42,4 +44,6 @@ __all__ = [
     "compute_bump_dv01_python",
     "run_pure_pricing_duckdb",
     "run_pure_swaption_pricing_duckdb",
+    "run_pure_dv01_duckdb",
+    "run_pure_vega_duckdb",
 ]

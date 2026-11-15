@@ -64,6 +64,9 @@ Class pricing::PrVolPoint
    expiryT: Float[1];
    swapTenorT: Float[1];
    vol: Float[1];
+   beta: Float[1];
+   rho: Float[1];
+   nu: Float[1];
 }
 
 // Interpolate a discount factor P(0, t) from bracketing knots (t0, r0) and (t1, r1).
@@ -152,7 +155,9 @@ function pricing::curveDiscountFactors(
 }
 
 // Price every linear cashflow across all scenarios in PrCurveKnot without assuming curve interpolation.
-function pricing::cashflowPvs(): meta::pure::metamodel::relation::Relation<(scenarioId:String[1], tradeId:String[1], legId:String[1], cfIdx:Integer[1], instrumentType:String[1], currency:String[1], pv:Float[1])>[1]
+function pricing::cashflowPvs(
+   curveModel: meta::pure::metamodel::function::Function<{meta::pure::metamodel::relation::Relation<(scenarioId:String[1], curveId:String[1], t:Float[1])>[1]->meta::pure::metamodel::relation::Relation<(scenarioId:String[1], curveId:String[1], t:Float[1], df:Float[1])>[1]}>[1]
+): meta::pure::metamodel::relation::Relation<(scenarioId:String[1], tradeId:String[1], legId:String[1], cfIdx:Integer[1], instrumentType:String[1], currency:String[1], pv:Float[1])>[1]
 {
    let cfs = pricing::PrCashflow.all()->filter(cf | $cf.instrumentType != 'SWAPTION_UNDERLYING')->project(~[
       tradeId: cf | $cf.tradeId,
@@ -181,7 +186,7 @@ function pricing::cashflowPvs(): meta::pure::metamodel::relation::Relation<(scen
    let startTargets = $cfScen->filter(x | $x.isFloat)->project(~[scenarioId: x | $x.scenarioId, curveId: x | $x.projCurveId, t: x | $x.accrualStartT])->distinct();
    let endTargets = $cfScen->filter(x | $x.isFloat)->project(~[scenarioId: x | $x.scenarioId, curveId: x | $x.projCurveId, t: x | $x.accrualEndT])->distinct();
    let allTargets = $discTargets->concatenate($startTargets)->concatenate($endTargets)->distinct();
-   let dfs = pricing::curveDiscountFactors($allTargets);
+   let dfs = $curveModel->eval($allTargets);
    let withDfPay = $cfScen->join(
       $dfs->project(~[dScen: x | $x.scenarioId, dCurve: x | $x.curveId, dT: x | $x.t, dfPay: x | $x.df]),
       meta::pure::functions::relation::JoinKind.INNER,
@@ -214,14 +219,20 @@ function pricing::cashflowPvs(): meta::pure::metamodel::relation::Relation<(scen
    ]);
 }
 
+function pricing::cashflowPvs(): meta::pure::metamodel::relation::Relation<(scenarioId:String[1], tradeId:String[1], legId:String[1], cfIdx:Integer[1], instrumentType:String[1], currency:String[1], pv:Float[1])>[1]
+{
+   pricing::cashflowPvs({t | pricing::curveDiscountFactors($t)});
+}
+
 // Standard normal CDF via meta::legend::lite::erf.
 function pricing::normCdf(x: Float[1]): Float[1]
 {
    0.5 * (1.0 + ($x / 1.4142135623730951)->erf());
 }
 
-// Black-76 swaption present value given transient annuity, forward swap rate, and interpolated vol.
-function pricing::black76SwaptionPv(
+// Bachelier (Normal) swaption present value given transient annuity, forward swap rate, and normal vol.
+// Supports negative, zero, and positive forward rates and strikes.
+function pricing::bachelierSwaptionPv(
    annuity: Float[1],
    fwdRate: Float[1],
    strike: Float[1],
@@ -234,10 +245,10 @@ function pricing::black76SwaptionPv(
 {
    let stdDev = $vol * $expiryT->sqrt();
    let safeStd = if($stdDev > 1.0e-12, |$stdDev, |1.0e-12);
-   let d1 = (($fwdRate / $strike)->log() + 0.5 * $safeStd * $safeStd) / $safeStd;
-   let d2 = $d1 - $safeStd;
-   let payerVal = $fwdRate * pricing::normCdf($d1) - $strike * pricing::normCdf($d2);
-   let receiverVal = $strike * pricing::normCdf(-$d2) - $fwdRate * pricing::normCdf(-$d1);
+   let d = ($fwdRate - $strike) / $safeStd;
+   let phiD = 0.3989422804014327 * (-0.5 * $d * $d)->exp();
+   let payerVal = ($fwdRate - $strike) * pricing::normCdf($d) + $safeStd * $phiD;
+   let receiverVal = ($strike - $fwdRate) * pricing::normCdf(-$d) + $safeStd * $phiD;
    let intrinsicPayer = if($fwdRate > $strike, |$fwdRate - $strike, |0.0);
    let intrinsicReceiver = if($strike > $fwdRate, |$strike - $fwdRate, |0.0);
    let optRate = if($stdDev <= 1.0e-12,
@@ -247,11 +258,42 @@ function pricing::black76SwaptionPv(
    $payReceive * $notional * $annuity * $optRate;
 }
 
-// Bilinearly interpolate implied Black vol from PrVolPoint over (expiryT, swapTenorT),
-// falling back to scenarioId='BASE' when a rate-only scenario has no vol-surface override.
-function pricing::volInterpolate(
+// Hagan (2002) Normal SABR implied volatility sigma_N(F, K, T; alpha, beta, rho, nu).
+// Supports beta=0 (pure normal SABR, valid for negative/zero rates) through beta=1 (lognormal backbone).
+function pricing::sabrNormalVol(
+   fwdRate: Float[1],
+   strike: Float[1],
+   expiryT: Float[1],
+   alpha: Float[1],
+   beta: Float[1],
+   rho: Float[1],
+   nu: Float[1]
+): Float[1]
+{
+   let fMid = 0.5 * ($fwdRate + $strike);
+   let cMid = if($beta == 0.0, |1.0, |$fMid->pow($beta));
+   let g1 = if($beta == 0.0, |0.0, |$beta / $fMid);
+   let g2 = if($beta == 0.0, |0.0, |$beta * ($beta - 1.0) / ($fMid * $fMid));
+   let dfk = $fwdRate - $strike;
+   let z = ($nu / $alpha) * ($dfk / $cMid);
+   let zOverX = if($z->abs() < 1.0e-7,
+      |1.0 - 0.5 * $rho * $z + ((2.0 - 3.0 * $rho * $rho) / 12.0) * $z * $z,
+      |$z / (((1.0 - 2.0 * $rho * $z + $z * $z)->sqrt() + $z - $rho) / (1.0 - $rho))->log()
+   );
+   let smile = 1.0 + ($g2 / 24.0) * $dfk * $dfk;
+   let corr = 1.0 + $expiryT * (
+      ((2.0 * $g2 - $g1 * $g1) / 24.0) * ($alpha * $alpha) * ($cMid * $cMid)
+      + 0.25 * $rho * $nu * $alpha * $g1 * $cMid
+      + ((2.0 - 3.0 * $rho * $rho) / 24.0) * $nu * $nu
+   );
+   ($alpha * $cMid * $smile * $zOverX * $corr)->cast(@Float);
+}
+
+// Bilinearly interpolate SABR parameters (alpha=vol, beta, rho, nu) from PrVolPoint over (expiryT, swapTenorT),
+// returning the interpolated parameters plus the 4 corner point indices and bilinear weights.
+function pricing::volInterpolateWithWeights(
    targets: meta::pure::metamodel::relation::Relation<(scenarioId:String[1], volSurfaceId:String[1], expiryT:Float[1], swapTenorT:Float[1])>[1]
-): meta::pure::metamodel::relation::Relation<(scenarioId:String[1], volSurfaceId:String[1], expiryT:Float[1], swapTenorT:Float[1], vol:Float[1])>[1]
+): meta::pure::metamodel::relation::Relation<(scenarioId:String[1], volSurfaceId:String[1], expiryT:Float[1], swapTenorT:Float[1], vol:Float[1], beta:Float[1], rho:Float[1], nu:Float[1], p00Idx:Integer[1], w00:Float[1], p01Idx:Integer[1], w01:Float[1], p10Idx:Integer[1], w10:Float[1], p11Idx:Integer[1], w11:Float[1])>[1]
 {
    let volScens = pricing::PrVolPoint.all()
       ->project(~[vsScenario: v | $v.scenarioId, vsSurf: v | $v.volSurfaceId])
@@ -268,9 +310,13 @@ function pricing::volInterpolate(
    let pts = pricing::PrVolPoint.all()->project(~[
       vScen: v | $v.scenarioId,
       vSurf: v | $v.volSurfaceId,
+      vIdx: v | $v.pointIdx,
       vExp: v | $v.expiryT,
       vTen: v | $v.swapTenorT,
-      vVol: v | $v.vol
+      vVol: v | $v.vol,
+      vBeta: v | $v.beta,
+      vRho: v | $v.rho,
+      vNu: v | $v.nu
    ]);
    let brackets = $resolvedTargets
       ->join($pts, meta::pure::functions::relation::JoinKind.INNER, {l, r | ($l.effScen == $r.vScen) && ($l.volSurfaceId == $r.vSurf)})
@@ -299,21 +345,113 @@ function pricing::volInterpolate(
          t0: x | if($x.t0Raw < -999999999.0, |$x.tMin->toOne(), |$x.t0Raw->toOne()),
          t1: x | if($x.t1Raw > 999999999.0, |$x.tMax->toOne(), |$x.t1Raw->toOne())
       ]);
-   let c00 = $brackets->join($pts->project(~[s00: v|$v.vScen, f00: v|$v.vSurf, e00: v|$v.vExp, t00: v|$v.vTen, v00: v|$v.vVol]), meta::pure::functions::relation::JoinKind.INNER, {l, r | ($l.effScen == $r.s00) && ($l.volSurfaceId == $r.f00) && ($l.e0 == $r.e00) && ($l.t0 == $r.t00)});
-   let c01 = $c00->join($pts->project(~[s01: v|$v.vScen, f01: v|$v.vSurf, e01: v|$v.vExp, t01: v|$v.vTen, v01: v|$v.vVol]), meta::pure::functions::relation::JoinKind.INNER, {l, r | ($l.effScen == $r.s01) && ($l.volSurfaceId == $r.f01) && ($l.e0 == $r.e01) && ($l.t1 == $r.t01)});
-   let c10 = $c01->join($pts->project(~[s10: v|$v.vScen, f10: v|$v.vSurf, e10: v|$v.vExp, t10: v|$v.vTen, v10: v|$v.vVol]), meta::pure::functions::relation::JoinKind.INNER, {l, r | ($l.effScen == $r.s10) && ($l.volSurfaceId == $r.f10) && ($l.e1 == $r.e10) && ($l.t0 == $r.t10)});
-   let c11 = $c10->join($pts->project(~[s11: v|$v.vScen, f11: v|$v.vSurf, e11: v|$v.vExp, t11: v|$v.vTen, v11: v|$v.vVol]), meta::pure::functions::relation::JoinKind.INNER, {l, r | ($l.effScen == $r.s11) && ($l.volSurfaceId == $r.f11) && ($l.e1 == $r.e11) && ($l.t1 == $r.t11)});
+   let c00 = $brackets->join($pts->project(~[s00: v|$v.vScen, f00: v|$v.vSurf, p00: v|$v.vIdx, e00: v|$v.vExp, t00: v|$v.vTen, v00: v|$v.vVol, b00: v|$v.vBeta, r00: v|$v.vRho, n00: v|$v.vNu]), meta::pure::functions::relation::JoinKind.INNER, {l, r | ($l.effScen == $r.s00) && ($l.volSurfaceId == $r.f00) && ($l.e0 == $r.e00) && ($l.t0 == $r.t00)});
+   let c01 = $c00->join($pts->project(~[s01: v|$v.vScen, f01: v|$v.vSurf, p01: v|$v.vIdx, e01: v|$v.vExp, t01: v|$v.vTen, v01: v|$v.vVol, b01: v|$v.vBeta, r01: v|$v.vRho, n01: v|$v.vNu]), meta::pure::functions::relation::JoinKind.INNER, {l, r | ($l.effScen == $r.s01) && ($l.volSurfaceId == $r.f01) && ($l.e0 == $r.e01) && ($l.t1 == $r.t01)});
+   let c10 = $c01->join($pts->project(~[s10: v|$v.vScen, f10: v|$v.vSurf, p10: v|$v.vIdx, e10: v|$v.vExp, t10: v|$v.vTen, v10: v|$v.vVol, b10: v|$v.vBeta, r10: v|$v.vRho, n10: v|$v.vNu]), meta::pure::functions::relation::JoinKind.INNER, {l, r | ($l.effScen == $r.s10) && ($l.volSurfaceId == $r.f10) && ($l.e1 == $r.e10) && ($l.t0 == $r.t10)});
+   let c11 = $c10->join($pts->project(~[s11: v|$v.vScen, f11: v|$v.vSurf, p11: v|$v.vIdx, e11: v|$v.vExp, t11: v|$v.vTen, v11: v|$v.vVol, b11: v|$v.vBeta, r11: v|$v.vRho, n11: v|$v.vNu]), meta::pure::functions::relation::JoinKind.INNER, {l, r | ($l.effScen == $r.s11) && ($l.volSurfaceId == $r.f11) && ($l.e1 == $r.e11) && ($l.t1 == $r.t11)});
    $c11
       ->extend(~[
          we: x | if($x.e1 > $x.e0, |if($x.expiryT <= $x.e0, |0.0, |if($x.expiryT >= $x.e1, |1.0, |($x.expiryT - $x.e0) / ($x.e1 - $x.e0))), |0.0),
          wt: x | if($x.t1 > $x.t0, |if($x.swapTenorT <= $x.t0, |0.0, |if($x.swapTenorT >= $x.t1, |1.0, |($x.swapTenorT - $x.t0) / ($x.t1 - $x.t0))), |0.0)
+      ])
+      ->extend(~[
+         w00: x | (1.0 - $x.we) * (1.0 - $x.wt),
+         w01: x | (1.0 - $x.we) * $x.wt,
+         w10: x | $x.we * (1.0 - $x.wt),
+         w11: x | $x.we * $x.wt
       ])
       ->project(~[
          scenarioId: x | $x.scenarioId,
          volSurfaceId: x | $x.volSurfaceId,
          expiryT: x | $x.expiryT,
          swapTenorT: x | $x.swapTenorT,
-         vol: x | (1.0 - $x.we) * ((1.0 - $x.wt) * $x.v00 + $x.wt * $x.v01) + $x.we * ((1.0 - $x.wt) * $x.v10 + $x.wt * $x.v11)
+         vol: x | $x.w00 * $x.v00 + $x.w01 * $x.v01 + $x.w10 * $x.v10 + $x.w11 * $x.v11,
+         beta: x | $x.w00 * $x.b00 + $x.w01 * $x.b01 + $x.w10 * $x.b10 + $x.w11 * $x.b11,
+         rho: x | $x.w00 * $x.r00 + $x.w01 * $x.r01 + $x.w10 * $x.r10 + $x.w11 * $x.r11,
+         nu: x | $x.w00 * $x.n00 + $x.w01 * $x.n01 + $x.w10 * $x.n10 + $x.w11 * $x.n11,
+         p00Idx: x | $x.p00,
+         w00: x | $x.w00,
+         p01Idx: x | $x.p01,
+         w01: x | $x.w01,
+         p10Idx: x | $x.p10,
+         w10: x | $x.w10,
+         p11Idx: x | $x.p11,
+         w11: x | $x.w11
+      ]);
+}
+
+function pricing::volInterpolate(
+   targets: meta::pure::metamodel::relation::Relation<(scenarioId:String[1], volSurfaceId:String[1], expiryT:Float[1], swapTenorT:Float[1])>[1]
+): meta::pure::metamodel::relation::Relation<(scenarioId:String[1], volSurfaceId:String[1], expiryT:Float[1], swapTenorT:Float[1], vol:Float[1])>[1]
+{
+   pricing::volInterpolateWithWeights($targets)->project(~[
+      scenarioId: x | $x.scenarioId,
+      volSurfaceId: x | $x.volSurfaceId,
+      expiryT: x | $x.expiryT,
+      swapTenorT: x | $x.swapTenorT,
+      vol: x | $x.vol
+   ]);
+}
+
+// Flat Normal scalar vol kernel (ignores fwdRate, strike, beta, rho, nu; returns alpha=normal vol).
+function pricing::flatNormalVolKernel(
+   fwdRate: Float[1],
+   strike: Float[1],
+   expiryT: Float[1],
+   alpha: Float[1],
+   beta: Float[1],
+   rho: Float[1],
+   nu: Float[1]
+): Float[1]
+{
+   $alpha;
+}
+
+// Flat Normal vol surface evaluator (bilinearly interpolates grid normal vol, ignoring fwdRate & strike).
+function pricing::flatNormalVolInterpolate(
+   targets: meta::pure::metamodel::relation::Relation<(scenarioId:String[1], volSurfaceId:String[1], expiryT:Float[1], swapTenorT:Float[1], fwdRate:Float[1], strike:Float[1])>[1]
+): meta::pure::metamodel::relation::Relation<(scenarioId:String[1], volSurfaceId:String[1], expiryT:Float[1], swapTenorT:Float[1], fwdRate:Float[1], strike:Float[1], vol:Float[1])>[1]
+{
+   let gridTargets = $targets->project(~[scenarioId: x|$x.scenarioId, volSurfaceId: x|$x.volSurfaceId, expiryT: x|$x.expiryT, swapTenorT: x|$x.swapTenorT])->distinct();
+   let params = pricing::volInterpolateWithWeights($gridTargets);
+   $targets
+      ->join(
+         $params->project(~[pScen: p|$p.scenarioId, pSurf: p|$p.volSurfaceId, pExp: p|$p.expiryT, pTen: p|$p.swapTenorT, alpha: p|$p.vol]),
+         meta::pure::functions::relation::JoinKind.INNER,
+         {l, r | ($l.scenarioId == $r.pScen) && ($l.volSurfaceId == $r.pSurf) && ($l.expiryT == $r.pExp) && ($l.swapTenorT == $r.pTen)}
+      )
+      ->project(~[
+         scenarioId: x | $x.scenarioId,
+         volSurfaceId: x | $x.volSurfaceId,
+         expiryT: x | $x.expiryT,
+         swapTenorT: x | $x.swapTenorT,
+         fwdRate: x | $x.fwdRate,
+         strike: x | $x.strike,
+         vol: x | $x.alpha
+      ]);
+}
+
+// Interpolate SABR parameters over (expiryT, swapTenorT) and evaluate implied Normal vol at (fwdRate, strike).
+function pricing::sabrNormalVolInterpolate(
+   targets: meta::pure::metamodel::relation::Relation<(scenarioId:String[1], volSurfaceId:String[1], expiryT:Float[1], swapTenorT:Float[1], fwdRate:Float[1], strike:Float[1])>[1]
+): meta::pure::metamodel::relation::Relation<(scenarioId:String[1], volSurfaceId:String[1], expiryT:Float[1], swapTenorT:Float[1], fwdRate:Float[1], strike:Float[1], vol:Float[1])>[1]
+{
+   let gridTargets = $targets->project(~[scenarioId: x|$x.scenarioId, volSurfaceId: x|$x.volSurfaceId, expiryT: x|$x.expiryT, swapTenorT: x|$x.swapTenorT])->distinct();
+   let params = pricing::volInterpolateWithWeights($gridTargets);
+   $targets
+      ->join(
+         $params->project(~[pScen: p|$p.scenarioId, pSurf: p|$p.volSurfaceId, pExp: p|$p.expiryT, pTen: p|$p.swapTenorT, alpha: p|$p.vol, beta: p|$p.beta, rho: p|$p.rho, nu: p|$p.nu]),
+         meta::pure::functions::relation::JoinKind.INNER,
+         {l, r | ($l.scenarioId == $r.pScen) && ($l.volSurfaceId == $r.pSurf) && ($l.expiryT == $r.pExp) && ($l.swapTenorT == $r.pTen)}
+      )
+      ->project(~[
+         scenarioId: x | $x.scenarioId,
+         volSurfaceId: x | $x.volSurfaceId,
+         expiryT: x | $x.expiryT,
+         swapTenorT: x | $x.swapTenorT,
+         fwdRate: x | $x.fwdRate,
+         strike: x | $x.strike,
+         vol: x | pricing::sabrNormalVol($x.fwdRate, $x.strike, $x.expiryT, $x.alpha, $x.beta, $x.rho, $x.nu)
       ]);
 }
 
@@ -328,7 +466,10 @@ function pricing::cashSettledAnnuity(rate: Float[1], nPeriods: Float[1], freq: F
 
 // Price every European swaption (PHYSICAL or CASH) across all curve scenarios.
 // Pure-as-function form: uses O(1) closed-form pricing::cashSettledAnnuity for CASH settlement.
-function pricing::swaptionPvs(): meta::pure::metamodel::relation::Relation<(scenarioId:String[1], tradeId:String[1], currency:String[1], annuity:Float[1], fwdRate:Float[1], vol:Float[1], pv:Float[1])>[1]
+function pricing::swaptionPvs(
+   curveModel: meta::pure::metamodel::function::Function<{meta::pure::metamodel::relation::Relation<(scenarioId:String[1], curveId:String[1], t:Float[1])>[1]->meta::pure::metamodel::relation::Relation<(scenarioId:String[1], curveId:String[1], t:Float[1], df:Float[1])>[1]}>[1],
+   volModel: meta::pure::metamodel::function::Function<{meta::pure::metamodel::relation::Relation<(scenarioId:String[1], volSurfaceId:String[1], expiryT:Float[1], swapTenorT:Float[1], fwdRate:Float[1], strike:Float[1])>[1]->meta::pure::metamodel::relation::Relation<(scenarioId:String[1], volSurfaceId:String[1], expiryT:Float[1], swapTenorT:Float[1], fwdRate:Float[1], strike:Float[1], vol:Float[1])>[1]}>[1]
+): meta::pure::metamodel::relation::Relation<(scenarioId:String[1], tradeId:String[1], currency:String[1], annuity:Float[1], fwdRate:Float[1], vol:Float[1], pv:Float[1])>[1]
 {
    let swpCfs = pricing::PrCashflow.all()
       ->filter(cf | $cf.instrumentType == 'SWAPTION_UNDERLYING')
@@ -370,7 +511,7 @@ function pricing::swaptionPvs(): meta::pure::metamodel::relation::Relation<(scen
    let startTargets = $cfScen->filter(x | $x.isFloat)->project(~[scenarioId: x | $x.scenarioId, curveId: x | $x.projCurveId, t: x | $x.accrualStartT])->distinct();
    let endTargets = $cfScen->filter(x | $x.isFloat)->project(~[scenarioId: x | $x.scenarioId, curveId: x | $x.projCurveId, t: x | $x.accrualEndT])->distinct();
    let allTargets = $discTargets->concatenate($settleTargets)->concatenate($startTargets)->concatenate($endTargets)->distinct();
-   let dfs = pricing::curveDiscountFactors($allTargets);
+   let dfs = $curveModel->eval($allTargets);
    let withDfPay = $cfScen->join(
       $dfs->project(~[dScen: x | $x.scenarioId, dCurve: x | $x.curveId, dT: x | $x.t, dfPay: x | $x.df]),
       meta::pure::functions::relation::JoinKind.INNER,
@@ -430,13 +571,15 @@ function pricing::swaptionPvs(): meta::pure::metamodel::relation::Relation<(scen
       scenarioId: x | $x.scenarioId,
       volSurfaceId: x | $x.volSurfaceId,
       expiryT: x | $x.expiryT,
-      swapTenorT: x | $x.swapTenorT
+      swapTenorT: x | $x.swapTenorT,
+      fwdRate: x | $x.fwdRate,
+      strike: x | $x.strike
    ])->distinct();
-   let vols = pricing::volInterpolate($volTargets);
+   let vols = $volModel->eval($volTargets);
    let withVol = $withSettleDf->join(
-      $vols->project(~[vScen: v | $v.scenarioId, vSurf: v | $v.volSurfaceId, vExp: v | $v.expiryT, vTen: v | $v.swapTenorT, vol: v | $v.vol]),
+      $vols->project(~[vScen: v | $v.scenarioId, vSurf: v | $v.volSurfaceId, vExp: v | $v.expiryT, vTen: v | $v.swapTenorT, vFwd: v | $v.fwdRate, vStrike: v | $v.strike, vol: v | $v.vol]),
       meta::pure::functions::relation::JoinKind.INNER,
-      {l, r | ($l.scenarioId == $r.vScen) && ($l.volSurfaceId == $r.vSurf) && ($l.expiryT == $r.vExp) && ($l.swapTenorT == $r.vTen)}
+      {l, r | ($l.scenarioId == $r.vScen) && ($l.volSurfaceId == $r.vSurf) && ($l.expiryT == $r.vExp) && ($l.swapTenorT == $r.vTen) && ($l.fwdRate == $r.vFwd) && ($l.strike == $r.vStrike)}
    );
    $withVol
       ->extend(~effAnnuity: x | if($x.settlementType == 'CASH', |$x.dfSettle * pricing::cashSettledAnnuity($x.fwdRate, $x.nPeriods, $x.cashFreq), |$x.physAnnuity->toOne()))
@@ -447,13 +590,21 @@ function pricing::swaptionPvs(): meta::pure::metamodel::relation::Relation<(scen
          annuity: x | $x.effAnnuity,
          fwdRate: x | $x.fwdRate,
          vol: x | $x.vol,
-         pv: x | pricing::black76SwaptionPv($x.effAnnuity, $x.fwdRate, $x.strike, $x.expiryT, $x.vol, $x.notional, $x.isPayer, $x.payReceive)
+         pv: x | pricing::bachelierSwaptionPv($x.effAnnuity, $x.fwdRate, $x.strike, $x.expiryT, $x.vol, $x.notional, $x.isPayer, $x.payReceive)
       ]);
+}
+
+function pricing::swaptionPvs(): meta::pure::metamodel::relation::Relation<(scenarioId:String[1], tradeId:String[1], currency:String[1], annuity:Float[1], fwdRate:Float[1], vol:Float[1], pv:Float[1])>[1]
+{
+   pricing::swaptionPvs({t | pricing::curveDiscountFactors($t)}, {v | pricing::sabrNormalVolInterpolate($v)});
 }
 
 // Pure-as-compilation / relational row-sum counterpart for CASH settlement:
 // sums (1/f)*(1 + S/f)^(-k) across the underlying fixed-leg PrCashflow rows in groupBy.
-function pricing::swaptionPvsRowSum(): meta::pure::metamodel::relation::Relation<(scenarioId:String[1], tradeId:String[1], currency:String[1], annuity:Float[1], fwdRate:Float[1], vol:Float[1], pv:Float[1])>[1]
+function pricing::swaptionPvsRowSum(
+   curveModel: meta::pure::metamodel::function::Function<{meta::pure::metamodel::relation::Relation<(scenarioId:String[1], curveId:String[1], t:Float[1])>[1]->meta::pure::metamodel::relation::Relation<(scenarioId:String[1], curveId:String[1], t:Float[1], df:Float[1])>[1]}>[1],
+   volModel: meta::pure::metamodel::function::Function<{meta::pure::metamodel::relation::Relation<(scenarioId:String[1], volSurfaceId:String[1], expiryT:Float[1], swapTenorT:Float[1], fwdRate:Float[1], strike:Float[1])>[1]->meta::pure::metamodel::relation::Relation<(scenarioId:String[1], volSurfaceId:String[1], expiryT:Float[1], swapTenorT:Float[1], fwdRate:Float[1], strike:Float[1], vol:Float[1])>[1]}>[1]
+): meta::pure::metamodel::relation::Relation<(scenarioId:String[1], tradeId:String[1], currency:String[1], annuity:Float[1], fwdRate:Float[1], vol:Float[1], pv:Float[1])>[1]
 {
    let swpCfs = pricing::PrCashflow.all()
       ->filter(cf | $cf.instrumentType == 'SWAPTION_UNDERLYING')
@@ -496,7 +647,7 @@ function pricing::swaptionPvsRowSum(): meta::pure::metamodel::relation::Relation
    let startTargets = $cfScen->filter(x | $x.isFloat)->project(~[scenarioId: x | $x.scenarioId, curveId: x | $x.projCurveId, t: x | $x.accrualStartT])->distinct();
    let endTargets = $cfScen->filter(x | $x.isFloat)->project(~[scenarioId: x | $x.scenarioId, curveId: x | $x.projCurveId, t: x | $x.accrualEndT])->distinct();
    let allTargets = $discTargets->concatenate($settleTargets)->concatenate($startTargets)->concatenate($endTargets)->distinct();
-   let dfs = pricing::curveDiscountFactors($allTargets);
+   let dfs = $curveModel->eval($allTargets);
    let withDfPay = $cfScen->join(
       $dfs->project(~[dScen: x | $x.scenarioId, dCurve: x | $x.curveId, dT: x | $x.t, dfPay: x | $x.df]),
       meta::pure::functions::relation::JoinKind.INNER,
@@ -566,13 +717,15 @@ function pricing::swaptionPvsRowSum(): meta::pure::metamodel::relation::Relation
       scenarioId: x | $x.scenarioId,
       volSurfaceId: x | $x.volSurfaceId,
       expiryT: x | $x.expiryT,
-      swapTenorT: x | $x.swapTenorT
+      swapTenorT: x | $x.swapTenorT,
+      fwdRate: x | $x.fwdRate,
+      strike: x | $x.strike
    ])->distinct();
-   let vols = pricing::volInterpolate($volTargets);
+   let vols = $volModel->eval($volTargets);
    let withVol = $rowCashAgg->join(
-      $vols->project(~[vScen: v | $v.scenarioId, vSurf: v | $v.volSurfaceId, vExp: v | $v.expiryT, vTen: v | $v.swapTenorT, vol: v | $v.vol]),
+      $vols->project(~[vScen: v | $v.scenarioId, vSurf: v | $v.volSurfaceId, vExp: v | $v.expiryT, vTen: v | $v.swapTenorT, vFwd: v | $v.fwdRate, vStrike: v | $v.strike, vol: v | $v.vol]),
       meta::pure::functions::relation::JoinKind.INNER,
-      {l, r | ($l.scenarioId == $r.vScen) && ($l.volSurfaceId == $r.vSurf) && ($l.expiryT == $r.vExp) && ($l.swapTenorT == $r.vTen)}
+      {l, r | ($l.scenarioId == $r.vScen) && ($l.volSurfaceId == $r.vSurf) && ($l.expiryT == $r.vExp) && ($l.swapTenorT == $r.vTen) && ($l.fwdRate == $r.vFwd) && ($l.strike == $r.vStrike)}
    );
    $withVol
       ->extend(~effAnnuity: x | if($x.settlementType == 'CASH', |$x.dfSettle * $x.cashAnnuityRaw->toOne()->cast(@Float), |$x.physAnnuity->toOne()))
@@ -583,6 +736,12 @@ function pricing::swaptionPvsRowSum(): meta::pure::metamodel::relation::Relation
          annuity: x | $x.effAnnuity,
          fwdRate: x | $x.fwdRate,
          vol: x | $x.vol,
-         pv: x | pricing::black76SwaptionPv($x.effAnnuity, $x.fwdRate, $x.strike, $x.expiryT, $x.vol, $x.notional, $x.isPayer, $x.payReceive)
+         pv: x | pricing::bachelierSwaptionPv($x.effAnnuity, $x.fwdRate, $x.strike, $x.expiryT, $x.vol, $x.notional, $x.isPayer, $x.payReceive)
       ]);
 }
+
+function pricing::swaptionPvsRowSum(): meta::pure::metamodel::relation::Relation<(scenarioId:String[1], tradeId:String[1], currency:String[1], annuity:Float[1], fwdRate:Float[1], vol:Float[1], pv:Float[1])>[1]
+{
+   pricing::swaptionPvsRowSum({t | pricing::curveDiscountFactors($t)}, {v | pricing::sabrNormalVolInterpolate($v)});
+}
+
