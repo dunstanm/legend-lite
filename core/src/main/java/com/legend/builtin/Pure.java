@@ -606,6 +606,11 @@ public final class Pure {
          *  its caller names without renaming it first. Upstream reads a column only as a reflected {@code Column}
          *  evaluated on a row ({@code $rel->columns()}, typed {@code Any}); a {@code ColSpec} there is a name alone. */
         public static final String READ = PKG + "read";
+        /** Symbolic differentiation of a univariate numeric lambda at an evaluation point:
+         *  {@code diff({x | expr}, point)} expands to the analytic derivative {@code d(expr)/dx} evaluated at
+         *  {@code point} during whole-program inlining (Phase G½, SymbolicDiff), so the database evaluates the
+         *  closed-form derivative expression in SQL. */
+        public static final String DIFF = PKG + "diff";
         /** Error function {@code erf(x) = (2 / sqrt(pi)) * integral_0^x exp(-t^2) dt}:
          *  lowers to {@code SqlFn.ERF} (native {@code erf} on Postgres 16+ and ClickHouse;
          *  Cody 1969 IEEE-754 rational minimax elsewhere). */
@@ -673,6 +678,7 @@ public final class Pure {
                     liteLocalName(Lite.MERGE),
                     liteLocalName(Lite.WITHOUT),
                     liteLocalName(Lite.READ),
+                    liteLocalName(Lite.DIFF),
                     liteLocalName(Lite.ERF));
 
     /** The same surface by FUNCTION ID: each bare name ({@link #LITE_SURFACE}) and the lite overloads it stands for,
@@ -689,6 +695,7 @@ public final class Pure {
                 java.util.Map.entry(liteLocalName(Lite.MERGE), AT_LEGEND_LITE_MERGE),
                 java.util.Map.entry(liteLocalName(Lite.WITHOUT), AT_LEGEND_LITE_WITHOUT),
                 java.util.Map.entry(liteLocalName(Lite.READ), AT_LEGEND_LITE_READ),
+                java.util.Map.entry(liteLocalName(Lite.DIFF), AT_LEGEND_LITE_DIFF),
                 java.util.Map.entry(liteLocalName(Lite.ERF), AT_LEGEND_LITE_ERF));
     }
 
@@ -1087,6 +1094,8 @@ public final class Pure {
     public static final NativeFunctionDefinition DECODE_BASE64__STRING_1 = signature("native function meta::pure::functions::string::decodeBase64(string:meta::pure::metamodel::type::String[1]):meta::pure::metamodel::type::String[1];");
     public static final NativeFunctionDefinition DENSE_RANK__RELATION_1__WINDOW_1__T_1 = signature("native function meta::pure::functions::relation::denseRank<T>(rel:meta::pure::metamodel::relation::Relation<T>[1], w:meta::pure::functions::relation::_Window<T>[1], row:T[1]):meta::pure::metamodel::type::Integer[1];");
     public static final NativeFunctionDefinition DESCENDING__COL_SPEC_1 = signature("native function meta::pure::functions::relation::descending<T>(column:meta::pure::metamodel::relation::ColSpec<T>[1]):meta::pure::functions::relation::SortInfo<T>[1];");
+    // diff (Lite.DIFF, lite surface): symbolic differentiation of a univariate numeric lambda at an evaluation point
+    public static final NativeFunctionDefinition DIFF__FUNCTION_1__NUMBER_1 = signature("native function meta::legend::lite::diff(fn:meta::pure::metamodel::function::Function<{meta::pure::metamodel::type::Float[1]->meta::pure::metamodel::type::Number[1]}>[1], x:meta::pure::metamodel::type::Number[1]):meta::pure::metamodel::type::Float[1];");
     public static final NativeFunctionDefinition DISTINCT__RELATION_1 = signature("native function meta::pure::functions::relation::distinct<T>(rel:meta::pure::metamodel::relation::Relation<T>[1]):meta::pure::metamodel::relation::Relation<T>[1];");
     public static final NativeFunctionDefinition DISTINCT__RELATION_1__COL_SPEC_ARRAY_1 = signature("native function meta::pure::functions::relation::distinct<X,T>(rel:meta::pure::metamodel::relation::Relation<T>[1], columns:meta::pure::metamodel::relation::ColSpecArray<X⊆T>[1]):meta::pure::metamodel::relation::Relation<X>[1];");
     public static final NativeFunctionDefinition IS_NUMERIC__STRING_0_1 = signature("native function meta::legend::lite::isNumeric(str:meta::pure::metamodel::type::String[0..1]):meta::pure::metamodel::type::Boolean[0..1];");
@@ -2544,6 +2553,7 @@ public final class Pure {
     public static final List<com.legend.model.FunctionId> AT_LEGEND_LITE_DATE_TIME_OF_TEXT = com.legend.model.FunctionId.ofAll(DATE_TIME_OF_TEXT__STRING_0_1);
     public static final List<com.legend.model.FunctionId> AT_LEGEND_LITE_DELETE = com.legend.model.FunctionId.ofAll(DELETE__ACCESSOR_1__FUNCTION_1);
     public static final List<com.legend.model.FunctionId> AT_LEGEND_LITE_DELETE_INSTANCES = com.legend.model.FunctionId.ofAll(DELETE_INSTANCES__RELATION_1__CLASS_1__COL_SPEC_1);
+    public static final List<com.legend.model.FunctionId> AT_LEGEND_LITE_DIFF = com.legend.model.FunctionId.ofAll(DIFF__FUNCTION_1__NUMBER_1);
     public static final List<com.legend.model.FunctionId> AT_LEGEND_LITE_DIVIDE_ROUND = com.legend.model.FunctionId.ofAll(DIVIDE_ROUND__NUMBER_1__NUMBER_1__INTEGER_1);
     public static final List<com.legend.model.FunctionId> AT_LEGEND_LITE_ELEMENT_ID = com.legend.model.FunctionId.ofAll(ELEMENT_ID__ANY_0_1, ELEMENT_ID__ANY_MANY);
     public static final List<com.legend.model.FunctionId> AT_LEGEND_LITE_ERF = com.legend.model.FunctionId.ofAll(ERF__NUMBER_1);

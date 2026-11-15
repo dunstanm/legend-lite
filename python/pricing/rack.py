@@ -79,6 +79,34 @@ class FraSpec:
 
 
 @dataclass(frozen=True)
+class XccyBasisSwapSpec:
+    """Float-for-float cross-currency basis swap with initial/final notional exchanges.
+
+    Leg 1 (foreign, e.g. EUR) pays/receives float(leg1_proj) + spread, discounted on
+    leg1_disc (e.g. EUR_DISC_USD), scaled by fx_spot (USD per 1 unit of ccy1) into
+    reporting currency so all cashflows share the single skinny PR_CASHFLOW table.
+    Leg 2 (base, e.g. USD) pays/receives flat float(leg2_proj), discounted on leg2_disc.
+    """
+
+    trade_id: str
+    ccy1: str
+    ccy2: str
+    leg1_discount_curve_id: str
+    leg1_proj_curve_id: str
+    leg2_discount_curve_id: str
+    leg2_proj_curve_id: str
+    start_date: dt.date
+    maturity_months: int
+    freq_months: int
+    notional_ccy1: float
+    fx_spot_ccy2_per_ccy1: float
+    leg1_spread: float
+    pay_leg1: bool = True
+    day_count1: str = "ACT/360"
+    day_count2: str = "ACT/360"
+
+
+@dataclass(frozen=True)
 class SwaptionSpec:
     trade_id: str
     ccy: str
@@ -123,6 +151,9 @@ class VolPoint:
     expiry_t: float
     swap_tenor_t: float
     vol: float
+    beta: float = 1.0
+    rho: float = 0.0
+    nu: float = 0.0
 
 
 def _add_months(d: dt.date, months: int) -> dt.date:
@@ -166,6 +197,31 @@ def adjust_date(
             cur -= dt.timedelta(days=1)
         return cur
     raise ValueError(f"Unsupported convention: {convention}")
+
+
+def imm_date(year: int, month: int) -> dt.date:
+    """Return the 3rd Wednesday (IMM date) of the given year and month."""
+    first = dt.date(year, month, 1)
+    # Wednesday is weekday() == 2
+    offset = (2 - first.weekday()) % 7
+    return first + dt.timedelta(days=offset + 14)
+
+
+def next_imm_dates(valuation_date: dt.date, count: int) -> list[dt.date]:
+    """Return the next `count` quarterly IMM dates (Mar/Jun/Sep/Dec) strictly after valuation_date."""
+    out: list[dt.date] = []
+    y, m = valuation_date.year, valuation_date.month
+    q_months = (3, 6, 9, 12)
+    while len(out) < count:
+        for qm in q_months:
+            if (y, qm) >= (valuation_date.year, valuation_date.month):
+                d = imm_date(y, qm)
+                if d > valuation_date:
+                    out.append(d)
+                    if len(out) == count:
+                        break
+        y += 1
+    return out
 
 
 def year_fraction(d1: dt.date, d2: dt.date, basis: str = "ACT/365F") -> float:
@@ -290,6 +346,86 @@ def expand_fra_to_cashflows(
             pay_receive=float_sign,
         ),
     ]
+
+
+def expand_xccy_basis_swap_to_cashflows(
+    spec: XccyBasisSwapSpec,
+    valuation_date: dt.date,
+    holidays: set[dt.date],
+) -> list[CashflowRow]:
+    """Expand a cross-currency basis swap (coupons + initial/final notional exchanges)
+    into the single skinny PR_CASHFLOW schema, expressed in ccy2 (reporting currency).
+    """
+    n_periods = spec.maturity_months // spec.freq_months
+    unadj_dates = [_add_months(spec.start_date, i * spec.freq_months) for i in range(n_periods + 1)]
+    adj_dates = [adjust_date(d, holidays, "MOD_FOLLOWING") for d in unadj_dates]
+
+    notional_rep = spec.notional_ccy1 * spec.fx_spot_ccy2_per_ccy1
+    leg1_sign = -1.0 if spec.pay_leg1 else 1.0
+    leg2_sign = -leg1_sign
+    rows: list[CashflowRow] = []
+
+    # Initial notional exchange at start_date (t_0): receive leg1 notional, pay leg2 notional (or vice versa)
+    t0 = year_fraction(valuation_date, adj_dates[0], "ACT/365F")
+    t_mat = year_fraction(valuation_date, adj_dates[-1], "ACT/365F")
+    rows.append(CashflowRow(
+        trade_id=spec.trade_id, leg_id="LEG1_NX", cf_idx=0,
+        instrument_type="XCCY", ccy=spec.ccy1,
+        discount_curve_id=spec.leg1_discount_curve_id, proj_curve_id=spec.leg1_proj_curve_id,
+        accrual_start_t=t0, accrual_end_t=t0, pay_t=t0, dcf=1.0,
+        notional=notional_rep, fixed_rate=1.0, spread=0.0, is_float=False,
+        pay_receive=-leg1_sign,
+    ))
+    rows.append(CashflowRow(
+        trade_id=spec.trade_id, leg_id="LEG2_NX", cf_idx=0,
+        instrument_type="XCCY", ccy=spec.ccy2,
+        discount_curve_id=spec.leg2_discount_curve_id, proj_curve_id=spec.leg2_proj_curve_id,
+        accrual_start_t=t0, accrual_end_t=t0, pay_t=t0, dcf=1.0,
+        notional=notional_rep, fixed_rate=1.0, spread=0.0, is_float=False,
+        pay_receive=-leg2_sign,
+    ))
+
+    for i in range(n_periods):
+        s_d, e_d = adj_dates[i], adj_dates[i + 1]
+        t_start = year_fraction(valuation_date, s_d, "ACT/365F")
+        t_end = year_fraction(valuation_date, e_d, "ACT/365F")
+        dcf1 = year_fraction(s_d, e_d, spec.day_count1)
+        dcf2 = year_fraction(s_d, e_d, spec.day_count2)
+        rows.append(CashflowRow(
+            trade_id=spec.trade_id, leg_id="LEG1", cf_idx=i,
+            instrument_type="XCCY", ccy=spec.ccy1,
+            discount_curve_id=spec.leg1_discount_curve_id, proj_curve_id=spec.leg1_proj_curve_id,
+            accrual_start_t=t_start, accrual_end_t=t_end, pay_t=t_end, dcf=dcf1,
+            notional=notional_rep, fixed_rate=0.0, spread=spec.leg1_spread, is_float=True,
+            pay_receive=leg1_sign,
+        ))
+        rows.append(CashflowRow(
+            trade_id=spec.trade_id, leg_id="LEG2", cf_idx=i,
+            instrument_type="XCCY", ccy=spec.ccy2,
+            discount_curve_id=spec.leg2_discount_curve_id, proj_curve_id=spec.leg2_proj_curve_id,
+            accrual_start_t=t_start, accrual_end_t=t_end, pay_t=t_end, dcf=dcf2,
+            notional=notional_rep, fixed_rate=0.0, spread=0.0, is_float=True,
+            pay_receive=leg2_sign,
+        ))
+
+    # Final notional exchange at maturity
+    rows.append(CashflowRow(
+        trade_id=spec.trade_id, leg_id="LEG1_NX", cf_idx=1,
+        instrument_type="XCCY", ccy=spec.ccy1,
+        discount_curve_id=spec.leg1_discount_curve_id, proj_curve_id=spec.leg1_proj_curve_id,
+        accrual_start_t=t_mat, accrual_end_t=t_mat, pay_t=t_mat, dcf=1.0,
+        notional=notional_rep, fixed_rate=1.0, spread=0.0, is_float=False,
+        pay_receive=leg1_sign,
+    ))
+    rows.append(CashflowRow(
+        trade_id=spec.trade_id, leg_id="LEG2_NX", cf_idx=1,
+        instrument_type="XCCY", ccy=spec.ccy2,
+        discount_curve_id=spec.leg2_discount_curve_id, proj_curve_id=spec.leg2_proj_curve_id,
+        accrual_start_t=t_mat, accrual_end_t=t_mat, pay_t=t_mat, dcf=1.0,
+        notional=notional_rep, fixed_rate=1.0, spread=0.0, is_float=False,
+        pay_receive=leg2_sign,
+    ))
+    return rows
 
 
 def expand_swaption_to_rows(
@@ -458,6 +594,72 @@ def fit_zero_curve(
     ]
 
 
+def fit_curve_from_cashflows(
+    benchmark_cashflows: Sequence[Sequence[CashflowRow]],
+    curve_id: str,
+    interp_method: str = "LOG_LINEAR_DF",
+    fixed_knots: Sequence[CurveKnot] = (),
+    initial_rate: float = 0.03,
+    max_iter: int = 25,
+    tol: float = 1e-12,
+) -> list[CurveKnot]:
+    """Fit `curve_id` from arbitrary pre-expanded benchmark instruments (IMM FRAs, OIS swaps,
+    or XCCY basis swaps) holding any upstream `fixed_knots` constant.
+    """
+    knot_ts = sorted({max(cf.pay_t for cf in cfs) for cfs in benchmark_cashflows})
+    if len(knot_ts) != len(benchmark_cashflows):
+        # Fall back to per-instrument max pay_t in given order if two pillars share a date
+        knot_ts = [max(cf.pay_t for cf in cfs) for cfs in benchmark_cashflows]
+    n = len(benchmark_cashflows)
+    rates = [initial_rate] * n
+    fixed_list = list(fixed_knots)
+    trade_ids = [cfs[0].trade_id for cfs in benchmark_cashflows]
+    scales = [cfs[0].notional for cfs in benchmark_cashflows]
+
+    def residuals(r_vec: list[float]) -> list[float]:
+        knots = fixed_list + [
+            CurveKnot("BASE", curve_id, idx, knot_ts[idx], r_vec[idx], interp_method)
+            for idx in range(n)
+        ]
+        res = []
+        for idx, cfs in enumerate(benchmark_cashflows):
+            npv = price_cashflows_python(cfs, knots)[("BASE", trade_ids[idx])]
+            res.append(npv / scales[idx])
+        return res
+
+    eps = 1e-7
+    for _ in range(max_iter):
+        f0 = residuals(rates)
+        if max(abs(v) for v in f0) < tol:
+            break
+        jac = [[0.0] * n for _ in range(n)]
+        for j in range(n):
+            r_bump = list(rates)
+            r_bump[j] += eps
+            f1 = residuals(r_bump)
+            for i in range(n):
+                jac[i][j] = (f1[i] - f0[i]) / eps
+        aug = [jac[i][:] + [-f0[i]] for i in range(n)]
+        for col in range(n):
+            piv = max(range(col, n), key=lambda r: abs(aug[r][col]))
+            aug[col], aug[piv] = aug[piv], aug[col]
+            pv = aug[col][col]
+            for r in range(col + 1, n):
+                factor = aug[r][col] / pv
+                for c in range(col, n + 1):
+                    aug[r][c] -= factor * aug[col][c]
+        delta = [0.0] * n
+        for i in range(n - 1, -1, -1):
+            s = aug[i][n] - sum(aug[i][c] * delta[c] for c in range(i + 1, n))
+            delta[i] = s / aug[i][i]
+        rates = [rates[i] + delta[i] for i in range(n)]
+
+    return [
+        CurveKnot("BASE", curve_id, idx, knot_ts[idx], rates[idx], interp_method)
+        for idx in range(n)
+    ]
+
+
 def build_curve_scenarios(
     base_knots: Sequence[CurveKnot],
     bump_bp: float = 1.0,
@@ -586,7 +788,49 @@ def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-def _interp_vol_py(vol_pts: Sequence[VolPoint], scen: str, surf: str, exp_t: float, ten_t: float) -> float:
+def sabr_normal_vol(
+    fwd_rate: float,
+    strike: float,
+    expiry_t: float,
+    alpha: float,
+    beta: float,
+    rho: float,
+    nu: float,
+) -> float:
+    """Hagan (2002) Normal SABR implied volatility."""
+    f_mid = 0.5 * (fwd_rate + strike)
+    if beta == 0.0:
+        c_mid = 1.0
+        g1 = 0.0
+        g2 = 0.0
+    else:
+        c_mid = f_mid ** beta
+        g1 = beta / f_mid
+        g2 = beta * (beta - 1.0) / (f_mid * f_mid)
+    dfk = fwd_rate - strike
+    z = (nu / alpha) * (dfk / c_mid)
+    if abs(z) < 1.0e-7:
+        z_over_x = 1.0 - 0.5 * rho * z + ((2.0 - 3.0 * rho * rho) / 12.0) * z * z
+    else:
+        z_over_x = z / math.log((math.sqrt(1.0 - 2.0 * rho * z + z * z) + z - rho) / (1.0 - rho))
+    smile = 1.0 + (g2 / 24.0) * dfk * dfk
+    corr = 1.0 + expiry_t * (
+        ((2.0 * g2 - g1 * g1) / 24.0) * (alpha * alpha) * (c_mid * c_mid)
+        + 0.25 * rho * nu * alpha * g1 * c_mid
+        + ((2.0 - 3.0 * rho * rho) / 24.0) * nu * nu
+    )
+    return alpha * c_mid * smile * z_over_x * corr
+
+
+def _interp_vol_py(
+    vol_pts: Sequence[VolPoint],
+    scen: str,
+    surf: str,
+    exp_t: float,
+    ten_t: float,
+    fwd_rate: float | None = None,
+    strike: float | None = None,
+) -> float:
     pts = [v for v in vol_pts if v.scenario_id == scen and v.vol_surface_id == surf]
     if not pts:
         pts = [v for v in vol_pts if v.scenario_id == "BASE" and v.vol_surface_id == surf]
@@ -596,12 +840,21 @@ def _interp_vol_py(vol_pts: Sequence[VolPoint], scen: str, surf: str, exp_t: flo
     e1 = min([e for e in exps if e >= exp_t], default=exps[-1])
     t0 = max([t for t in tens if t <= ten_t], default=tens[0])
     t1 = min([t for t in tens if t >= ten_t], default=tens[-1])
-    grid = {(v.expiry_t, v.swap_tenor_t): v.vol for v in pts}
+    grid = {(v.expiry_t, v.swap_tenor_t): v for v in pts}
     we = 0.0 if e1 <= e0 else min(1.0, max(0.0, (exp_t - e0) / (e1 - e0)))
     wt = 0.0 if t1 <= t0 else min(1.0, max(0.0, (ten_t - t0) / (t1 - t0)))
-    r0 = (1.0 - wt) * grid[(e0, t0)] + wt * grid[(e0, t1)]
-    r1 = (1.0 - wt) * grid[(e1, t0)] + wt * grid[(e1, t1)]
-    return (1.0 - we) * r0 + we * r1
+    w00 = (1.0 - we) * (1.0 - wt)
+    w01 = (1.0 - we) * wt
+    w10 = we * (1.0 - wt)
+    w11 = we * wt
+    p00, p01, p10, p11 = grid[(e0, t0)], grid[(e0, t1)], grid[(e1, t0)], grid[(e1, t1)]
+    alpha = w00 * p00.vol + w01 * p01.vol + w10 * p10.vol + w11 * p11.vol
+    beta = w00 * p00.beta + w01 * p01.beta + w10 * p10.beta + w11 * p11.beta
+    rho = w00 * p00.rho + w01 * p01.rho + w10 * p10.rho + w11 * p11.rho
+    nu = w00 * p00.nu + w01 * p01.nu + w10 * p10.nu + w11 * p11.nu
+    if fwd_rate is None or strike is None:
+        return alpha
+    return sabr_normal_vol(fwd_rate, strike, exp_t, alpha, beta, rho, nu)
 
 
 def price_swaptions_python(
@@ -653,17 +906,20 @@ def price_swaptions_python(
                 eff_ann = df_settle * c_ann
             else:
                 eff_ann = ann
-            vol = _interp_vol_py(vol_points, scen, sw.vol_surface_id, sw.expiry_t, sw.swap_tenor_t)
+            vol = _interp_vol_py(
+                vol_points, scen, sw.vol_surface_id, sw.expiry_t, sw.swap_tenor_t,
+                fwd_rate=fwd_rate, strike=sw.strike,
+            )
             std = vol * math.sqrt(sw.expiry_t)
             if std <= 1e-12:
                 opt = max(fwd_rate - sw.strike, 0.0) if sw.is_payer else max(sw.strike - fwd_rate, 0.0)
             else:
-                d1 = (math.log(fwd_rate / sw.strike) + 0.5 * std * std) / std
-                d2 = d1 - std
+                d = (fwd_rate - sw.strike) / std
+                phi_d = 0.3989422804014327 * math.exp(-0.5 * d * d)
                 if sw.is_payer:
-                    opt = fwd_rate * _norm_cdf(d1) - sw.strike * _norm_cdf(d2)
+                    opt = (fwd_rate - sw.strike) * _norm_cdf(d) + std * phi_d
                 else:
-                    opt = sw.strike * _norm_cdf(-d2) - fwd_rate * _norm_cdf(-d1)
+                    opt = (sw.strike - fwd_rate) * _norm_cdf(-d) + std * phi_d
             out[(scen, sw.trade_id)] = sw.pay_receive * sw.notional * eff_ann * opt
     return out
 
@@ -696,6 +952,9 @@ def _swaption_tables_to_arrow(
         "EXPIRY_T": pa.array([v.expiry_t for v in vol_points], type=pa.float64()),
         "SWAP_TENOR_T": pa.array([v.swap_tenor_t for v in vol_points], type=pa.float64()),
         "VOL": pa.array([v.vol for v in vol_points], type=pa.float64()),
+        "BETA": pa.array([v.beta for v in vol_points], type=pa.float64()),
+        "RHO": pa.array([v.rho for v in vol_points], type=pa.float64()),
+        "NU": pa.array([v.nu for v in vol_points], type=pa.float64()),
     })
     return swp_tbl, vol_tbl
 
@@ -707,10 +966,13 @@ def run_pure_swaption_pricing_duckdb(
     vol_points: Sequence[VolPoint],
     projects_dir: Path | None = None,
     mode: str = "function",
+    vol_model: str = "sabr",
 ) -> dict[tuple[str, str], float]:
     """Execute projects/pricing swaption pricer ('function' or 'row_sum') on DuckDB."""
     if projects_dir is None:
         projects_dir = Path(__file__).resolve().parents[2] / "projects" / "pricing"
+    if vol_model not in ("sabr", "flat_normal", "flat_black"):
+        raise ValueError(f"Unknown vol_model: {vol_model!r}")
     knot_tbl, cf_tbl = _tables_to_arrow(knots, cashflows)
     swp_tbl, vol_tbl = _swaption_tables_to_arrow(swaptions, vol_points)
 
@@ -727,7 +989,9 @@ def run_pure_swaption_pricing_duckdb(
 
         frames = ll.Frames(conn)
         model_text = _load_pricing_pure_sources(projects_dir)
-        fn = "pricing::swaptionPvs()" if mode == "function" else "pricing::swaptionPvsRowSum()"
+        vol_fn = "pricing::sabrNormalVolInterpolate" if vol_model == "sabr" else "pricing::flatNormalVolInterpolate"
+        base_fn = "pricing::swaptionPvs" if mode == "function" else "pricing::swaptionPvsRowSum"
+        fn = f"{base_fn}({{t | pricing::curveDiscountFactors($t)}}, {{v | {vol_fn}($v)}})"
         with ll.HeldModel(model_text) as held:
             query = f"{fn}->sort([~scenarioId->ascending(), ~tradeId->ascending()])"
             plan = held.plan(ll.parse(query), "pricing::DuckDbRuntime")
@@ -737,5 +1001,112 @@ def run_pure_swaption_pricing_duckdb(
 
     return {
         (row["scenarioId"], row["tradeId"]): float(row["pv"])
+        for row in out.to_pylist()
+    }
+
+
+def run_pure_dv01_duckdb(
+    knots: Sequence[CurveKnot],
+    cashflows: Sequence[CashflowRow],
+    swaptions: Sequence[SwaptionRow] = (),
+    vol_points: Sequence[VolPoint] = (),
+    projects_dir: Path | None = None,
+    kind: str = "cashflow",
+    vol_model: str = "sabr",
+) -> dict[tuple[str, str, int], float]:
+    """Execute AD pillar DV01s ('cashflow' or 'swaption') on DuckDB for 'BASE' knots."""
+    if projects_dir is None:
+        projects_dir = Path(__file__).resolve().parents[2] / "projects" / "pricing"
+    if kind not in ("cashflow", "swaption"):
+        raise ValueError(f"Unknown DV01 kind: {kind!r}")
+    if vol_model not in ("sabr", "flat_normal", "flat_black"):
+        raise ValueError(f"Unknown vol_model: {vol_model!r}")
+    knot_tbl, cf_tbl = _tables_to_arrow(knots, cashflows)
+    swp_tbl, vol_tbl = _swaption_tables_to_arrow(swaptions, vol_points)
+
+    conn = duckdb.connect(":memory:")
+    try:
+        conn.register("_arrow_knots", knot_tbl)
+        conn.register("_arrow_cfs", cf_tbl)
+        conn.register("_arrow_swps", swp_tbl)
+        conn.register("_arrow_vols", vol_tbl)
+        conn.execute("CREATE TABLE PR_CURVE_KNOT AS SELECT * FROM _arrow_knots")
+        conn.execute("CREATE TABLE PR_CASHFLOW AS SELECT * FROM _arrow_cfs")
+        conn.execute("CREATE TABLE PR_SWAPTION AS SELECT * FROM _arrow_swps")
+        conn.execute("CREATE TABLE PR_VOL_POINT AS SELECT * FROM _arrow_vols")
+
+        frames = ll.Frames(conn)
+        model_text = _load_pricing_pure_sources(projects_dir)
+        if kind == "cashflow":
+            fn = "pricing::cashflowDv01s()"
+        else:
+            vs = "pricing::sabrNormalVolWithDerivs" if vol_model == "sabr" else "pricing::flatNormalVolWithDerivs"
+            fn = (
+                "pricing::swaptionDv01s("
+                "{t | pricing::curveDfsWithDeriv($t)}, "
+                "{v | pricing::volInterpolateWithWeights($v)}, "
+                f"{{s | {vs}($s)}})"
+            )
+        with ll.HeldModel(model_text) as held:
+            query = (
+                f"{fn}->sort([~tradeId->ascending(), ~curveId->ascending(), "
+                "~knotIdx->ascending()])"
+            )
+            plan = held.plan(ll.parse(query), "pricing::DuckDbRuntime")
+            out = frames.run(plan)
+    finally:
+        conn.close()
+
+    return {
+        (row["tradeId"], row["curveId"], int(row["knotIdx"])): float(row["dv01"])
+        for row in out.to_pylist()
+    }
+
+
+def run_pure_vega_duckdb(
+    knots: Sequence[CurveKnot],
+    cashflows: Sequence[CashflowRow],
+    swaptions: Sequence[SwaptionRow],
+    vol_points: Sequence[VolPoint],
+    projects_dir: Path | None = None,
+    vol_model: str = "sabr",
+) -> dict[tuple[str, str, int], float]:
+    """Execute 1-pass AD surface vegas (1bp vol) on DuckDB for 'BASE'."""
+    if projects_dir is None:
+        projects_dir = Path(__file__).resolve().parents[2] / "projects" / "pricing"
+    if vol_model not in ("sabr", "flat_normal", "flat_black"):
+        raise ValueError(f"Unknown vol_model: {vol_model!r}")
+    knot_tbl, cf_tbl = _tables_to_arrow(knots, cashflows)
+    swp_tbl, vol_tbl = _swaption_tables_to_arrow(swaptions, vol_points)
+
+    conn = duckdb.connect(":memory:")
+    try:
+        conn.register("_arrow_knots", knot_tbl)
+        conn.register("_arrow_cfs", cf_tbl)
+        conn.register("_arrow_swps", swp_tbl)
+        conn.register("_arrow_vols", vol_tbl)
+        conn.execute("CREATE TABLE PR_CURVE_KNOT AS SELECT * FROM _arrow_knots")
+        conn.execute("CREATE TABLE PR_CASHFLOW AS SELECT * FROM _arrow_cfs")
+        conn.execute("CREATE TABLE PR_SWAPTION AS SELECT * FROM _arrow_swps")
+        conn.execute("CREATE TABLE PR_VOL_POINT AS SELECT * FROM _arrow_vols")
+
+        frames = ll.Frames(conn)
+        model_text = _load_pricing_pure_sources(projects_dir)
+        vs = "pricing::sabrNormalVolWithDerivs" if vol_model == "sabr" else "pricing::flatNormalVolWithDerivs"
+        with ll.HeldModel(model_text) as held:
+            query = (
+                "pricing::swaptionVegas("
+                "{t | pricing::curveDiscountFactors($t)}, "
+                "{v | pricing::volInterpolateWithWeights($v)}, "
+                f"{{s | {vs}($s)}})"
+                "->sort([~tradeId->ascending(), ~volSurfaceId->ascending(), ~pointIdx->ascending()])"
+            )
+            plan = held.plan(ll.parse(query), "pricing::DuckDbRuntime")
+            out = frames.run(plan)
+    finally:
+        conn.close()
+
+    return {
+        (row["tradeId"], row["volSurfaceId"], int(row["pointIdx"])): float(row["vega"])
         for row in out.to_pylist()
     }

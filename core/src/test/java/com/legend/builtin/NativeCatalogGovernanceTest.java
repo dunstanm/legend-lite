@@ -204,7 +204,9 @@ class NativeCatalogGovernanceTest {
         // ColSpec is a name alone and a column is read only as a reflected Column evaluated on a row (typed Any)
         // +1 2026-11-13 (Gaussian error function in Pure, Pure.Lite.ERF): erf -- native erf on Postgres 16+ and
         // ClickHouse, Cody IEEE-754 portable SQL expansion elsewhere; upstream math package stops at exp/log/sqrt/cbrt/trig
-        assertTrue(Pure.LITE_SURFACE.size() <= 10,
+        // +1 2026-11-15 (symbolic differentiation in Pure, Pure.Lite.DIFF): diff -- compile-time symbolic derivative
+        // of a univariate numeric lambda evaluated at a point, rewritten to closed-form SQL arithmetic in Phase G½
+        assertTrue(Pure.LITE_SURFACE.size() <= 11,
                 "LITE_SURFACE grew: " + Pure.LITE_SURFACE);
     }
 
